@@ -2415,7 +2415,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     // sibling video view placed below it.
     if let window = view.window,
        let flutterViewController = findFlutterViewController(from: window.rootViewController) {
-      flutterViewController.viewOpaque = false
+      flutterViewController.isViewOpaque = false
     }
     view.isOpaque = false
     view.backgroundColor = .clear

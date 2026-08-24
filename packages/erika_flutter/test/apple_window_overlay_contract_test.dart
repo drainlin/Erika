@@ -9,7 +9,7 @@ void main() {
         '$platform/Classes/ErikaFlutterPlugin.swift',
       ).readAsStringSync();
 
-      expect(plugin, contains('flutterViewController.viewOpaque = false'));
+      expect(plugin, contains('flutterViewController.isViewOpaque = false'));
       expect(plugin, contains('view.isOpaque = false'));
       expect(plugin, contains('view.layer.isOpaque = false'));
     });

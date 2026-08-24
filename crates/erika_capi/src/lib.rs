@@ -1197,6 +1197,29 @@ pub extern "C" fn erika_presenter_create_with_output_mode(
     }))
 }
 
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_presenter_create_with_playback_options(
+    output_mode: i32,
+    edr_headroom: f32,
+    buffer_recovery_audio_micros: u64,
+) -> *mut ErikaPresenterHandle {
+    let mut config = presenter_config_from_c(ErikaPresenterConfig {
+        output_mode,
+        edr_headroom,
+        ..ErikaPresenterConfig::default()
+    });
+    config.player.playback.buffer_recovery_audio =
+        Some(Duration::from_micros(buffer_recovery_audio_micros));
+    create_presenter_handle(config)
+}
+
 #[cfg(not(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
@@ -1222,6 +1245,22 @@ pub extern "C" fn erika_presenter_create_with_config(
 pub extern "C" fn erika_presenter_create_with_output_mode(
     _output_mode: i32,
     _edr_headroom: f32,
+) -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_presenter_create_with_playback_options(
+    _output_mode: i32,
+    _edr_headroom: f32,
+    _buffer_recovery_audio_micros: u64,
 ) -> *mut std::ffi::c_void {
     std::ptr::null_mut()
 }

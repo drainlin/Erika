@@ -273,6 +273,10 @@ impl NativeDependencyProfile {
             }
         } else if target.is_apple() {
             flags.extend([
+                "--enable-network",
+                "--enable-securetransport",
+                "--enable-protocol=http,https,tcp,tls",
+                "--enable-demuxer=hls",
                 "--enable-videotoolbox",
                 "--enable-libdav1d",
                 "--enable-decoder=libdav1d",
@@ -4878,6 +4882,10 @@ mod tests {
             NativeTarget::Aarch64Tvos,
         ] {
             let flags = NativeDependencyProfile::Lgpl.ffmpeg_configure_flags_for_target(target);
+            assert!(flags.contains(&"--enable-network"));
+            assert!(flags.contains(&"--enable-securetransport"));
+            assert!(flags.contains(&"--enable-protocol=http,https,tcp,tls"));
+            assert!(flags.contains(&"--enable-demuxer=hls"));
             assert!(flags.contains(&"--enable-videotoolbox"));
             assert!(flags.contains(&"--enable-libdav1d"));
             assert!(flags.contains(&"--enable-decoder=libdav1d"));

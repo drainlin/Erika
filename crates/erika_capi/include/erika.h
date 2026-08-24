@@ -502,6 +502,10 @@ ErikaPresenterHandle *erika_presenter_create_with_config(ErikaPresenterConfig co
 ErikaPresenterHandle *erika_presenter_create_with_output_mode(
     int32_t output_mode,
     float edr_headroom);
+ErikaPresenterHandle *erika_presenter_create_with_playback_options(
+    int32_t output_mode,
+    float edr_headroom,
+    uint64_t buffer_recovery_audio_micros);
 void erika_presenter_destroy(ErikaPresenterHandle *handle);
 
 /* Playback and runtime parameters. volume is 0.0–1.0; rate 1.0 is normal speed;

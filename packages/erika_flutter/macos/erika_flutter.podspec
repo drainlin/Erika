@@ -1,11 +1,11 @@
 Pod::Spec.new do |s|
   s.name             = 'erika_flutter'
-  s.version          = '0.1.6'
+  s.version          = '0.1.7'
   s.summary          = 'Flutter embedder glue for the Erika Rust media engine.'
   s.description      = <<-DESC
 Flutter macOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
                        DESC
-  s.homepage         = 'https://github.com/AimesSoft/Erika'
+  s.homepage         = 'https://github.com/drainlin/Erika'
   s.license          = { :type => 'MPL-2.0' }
   s.author           = { 'AimesSoft' => 'dev@aimesoft.com' }
   s.source           = { :path => '.' }

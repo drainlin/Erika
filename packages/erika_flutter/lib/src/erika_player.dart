@@ -781,6 +781,7 @@ class ErikaPlayer {
     this.upscaler,
     this.hdrDebug = false,
     this.allowBackgroundPlayback = false,
+    this.rebufferRecoveryThreshold = const Duration(milliseconds: 1500),
   }) {
     final headroom = edrHeadroom;
     if (headroom != null &&
@@ -789,6 +790,14 @@ class ErikaPlayer {
         headroom,
         'edrHeadroom',
         'must be finite and in [1, 10000]; omit it for system-auto headroom',
+      );
+    }
+    if (rebufferRecoveryThreshold <= Duration.zero ||
+        rebufferRecoveryThreshold > const Duration(milliseconds: 2500)) {
+      throw ArgumentError.value(
+        rebufferRecoveryThreshold,
+        'rebufferRecoveryThreshold',
+        'must be greater than zero and no longer than 2500 milliseconds',
       );
     }
     _eventSubscription ??= _events.receiveBroadcastStream().listen(
@@ -846,6 +855,12 @@ class ErikaPlayer {
   final ErikaUpscalerMode? upscaler;
   final bool hdrDebug;
   final bool allowBackgroundPlayback;
+
+  /// Audio Erika queues before resuming after a playback underrun.
+  ///
+  /// This does not change the initial startup buffer, so first playback can
+  /// remain responsive while rebuffer recovery uses a more stable threshold.
+  final Duration rebufferRecoveryThreshold;
 
   int? get id => _id;
 
@@ -1660,6 +1675,7 @@ class ErikaPlayer {
       if (upscaler case final mode?) 'upscaler': mode.nativeValue,
       if (hdrDebug) 'hdrDebug': true,
       if (allowBackgroundPlayback) 'allowBackgroundPlayback': true,
+      'bufferRecoveryAudioMicros': rebufferRecoveryThreshold.inMicroseconds,
     };
     if (hdrDebug) {
       debugPrint('ErikaHDR[Dart]: create arguments=$arguments');

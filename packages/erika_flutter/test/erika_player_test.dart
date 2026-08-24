@@ -55,7 +55,9 @@ void main() {
       (MethodCall call) => call.method == 'create',
     );
     expect(createCall.arguments, isA<Map<Object?, Object?>>());
-    expect(createCall.arguments as Map<Object?, Object?>, isEmpty);
+    expect(createCall.arguments, <String, Object?>{
+      'bufferRecoveryAudioMicros': 1500000,
+    });
 
     await player.dispose();
   });
@@ -75,6 +77,34 @@ void main() {
     );
     expect(createCall.arguments, <String, Object?>{
       'allowBackgroundPlayback': true,
+      'bufferRecoveryAudioMicros': 1500000,
+    });
+
+    await player.dispose();
+  });
+
+  test('rebuffer recovery threshold is validated and forwarded', () async {
+    expect(
+      () => ErikaPlayer(rebufferRecoveryThreshold: Duration.zero),
+      throwsArgumentError,
+    );
+    expect(
+      () => ErikaPlayer(
+        rebufferRecoveryThreshold: const Duration(milliseconds: 2501),
+      ),
+      throwsArgumentError,
+    );
+
+    final player = ErikaPlayer(
+      rebufferRecoveryThreshold: const Duration(milliseconds: 900),
+    );
+    expect(await player.ensureCreated(), 7);
+
+    final createCall = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'create',
+    );
+    expect(createCall.arguments, <String, Object?>{
+      'bufferRecoveryAudioMicros': 900000,
     });
 
     await player.dispose();

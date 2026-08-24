@@ -613,6 +613,11 @@ pub struct PlaybackSessionConfig {
     pub video_decode: VideoDecodePreference,
     pub audio_output: PcmFormat,
     pub timing: PlaybackTimingConfig,
+    /// Audio queued before playback resumes after a streaming underrun.
+    ///
+    /// `None` preserves Erika's source-specific defaults. This does not
+    /// affect the initial playback start threshold.
+    pub buffer_recovery_audio: Option<Duration>,
 }
 
 #[derive(Clone, Default)]
@@ -638,6 +643,7 @@ impl Default for PlaybackSessionConfig {
             video_decode: VideoDecodePreference::default(),
             audio_output: PcmFormat::default(),
             timing: PlaybackTimingConfig::default(),
+            buffer_recovery_audio: None,
         }
     }
 }
@@ -1182,7 +1188,10 @@ impl PlaybackSession {
             video_decoder_fallbacks,
             video_decoder_events,
             queue_limits,
-            buffer_recovery_audio: buffer_recovery_audio_for_request(request),
+            buffer_recovery_audio: buffer_recovery_audio_for_request(
+                request,
+                config.buffer_recovery_audio,
+            ),
             buffering_audio_video_scan: BufferingAudioVideoScan::default(),
             buffering_audio_recovery_suspended: false,
             demux_eof: false,
@@ -5558,7 +5567,13 @@ fn playback_timing_for_request(
     timing
 }
 
-fn buffer_recovery_audio_for_request(request: &MediaRequest) -> Duration {
+fn buffer_recovery_audio_for_request(
+    request: &MediaRequest,
+    configured: Option<Duration>,
+) -> Duration {
+    if let Some(configured) = configured {
+        return configured;
+    }
     if request_uses_http_source(request) {
         STREAMING_BUFFER_RECOVERY_AUDIO
     } else {
@@ -7367,7 +7382,7 @@ mod tests {
 
         assert_eq!(timing.audio_lead_time, STREAMING_AUDIO_LEAD_TIME);
         assert_eq!(
-            buffer_recovery_audio_for_request(&request),
+            buffer_recovery_audio_for_request(&request, None),
             STREAMING_BUFFER_RECOVERY_AUDIO,
         );
     }
@@ -7383,7 +7398,7 @@ mod tests {
 
         assert_eq!(timing.audio_lead_time, Duration::from_millis(750));
         assert_eq!(
-            buffer_recovery_audio_for_request(&request),
+            buffer_recovery_audio_for_request(&request, None),
             STREAMING_BUFFER_RECOVERY_AUDIO,
         );
     }
@@ -7395,8 +7410,19 @@ mod tests {
 
         assert_eq!(timing.audio_lead_time, DEFAULT_AUDIO_LEAD_TIME);
         assert_eq!(
-            buffer_recovery_audio_for_request(&request),
+            buffer_recovery_audio_for_request(&request, None),
             DEFAULT_BUFFER_RECOVERY_AUDIO,
+        );
+    }
+
+    #[test]
+    fn configured_buffer_recovery_audio_overrides_streaming_default() {
+        let request = MediaRequest::new("https://example.invalid/video.mkv");
+        let configured = Duration::from_millis(1_500);
+
+        assert_eq!(
+            buffer_recovery_audio_for_request(&request, Some(configured)),
+            configured,
         );
     }
 

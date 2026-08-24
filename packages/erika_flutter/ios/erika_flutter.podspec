@@ -9,6 +9,7 @@ Pod::Spec.new do |s|
     erika_presenter_close
     erika_presenter_create
     erika_presenter_create_with_output_mode
+    erika_presenter_create_with_playback_options
     erika_presenter_danmaku_tracks
     erika_presenter_destroy
     erika_presenter_detach_surface
@@ -54,12 +55,12 @@ Pod::Spec.new do |s|
     .join(' ')
 
   s.name             = 'erika_flutter'
-  s.version          = '0.1.6'
+  s.version          = '0.1.7'
   s.summary          = 'Flutter embedder glue for the Erika Rust media engine.'
   s.description      = <<-DESC
 Flutter iOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
                        DESC
-  s.homepage         = 'https://github.com/AimesSoft/Erika'
+  s.homepage         = 'https://github.com/drainlin/Erika'
   s.license          = { :type => 'MPL-2.0' }
   s.author           = { 'AimesSoft' => 'dev@aimesoft.com' }
   s.source           = { :path => '.' }
@@ -128,8 +129,6 @@ fi
 mkdir -p "$PODS_TARGET_SRCROOT/native"
 if [ -n "${ERIKA_IOS_CAPI_STATICLIB:-}" ]; then
   cp "$ERIKA_IOS_CAPI_STATICLIB" "$OUTPUT_LIB"
-elif [ "${ERIKA_FORCE_SOURCE_BUILD:-0}" != "1" ]; then
-  sh "$PACKAGE_ROOT/native/prepare_apple_prebuilt.sh"     ios "${PLATFORM_NAME:-iphoneos}" "$ARCH" "$OUTPUT_LIB"
 else
   if [ -n "${ERIKA_REPO_ROOT:-}" ]; then
     SOURCE_ROOT="$ERIKA_REPO_ROOT"
@@ -139,7 +138,7 @@ else
     SOURCE_ROOT="$(cd "$PACKAGE_ROOT/../.." && pwd -P)"
   fi
   if [ ! -f "$SOURCE_ROOT/crates/erika_capi/Cargo.toml" ]; then
-    echo "error: ERIKA_FORCE_SOURCE_BUILD=1 requires an Erika checkout; set ERIKA_REPO_ROOT" >&2
+    echo "error: Erika source checkout is invalid: $SOURCE_ROOT; set ERIKA_REPO_ROOT when using a detached package copy" >&2
     exit 1
   fi
   if command -v rustup >/dev/null 2>&1; then
@@ -177,6 +176,6 @@ fi
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    'OTHER_LDFLAGS' => "$(inherited) \"$(PODS_TARGET_SRCROOT)/native/liberika_capi.a\" #{erika_cabi_undefined_flags} -framework AVFoundation -framework AudioToolbox -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework Foundation -liconv -lbz2 -lz",
+    'OTHER_LDFLAGS' => "$(inherited) \"$(PODS_TARGET_SRCROOT)/native/liberika_capi.a\" #{erika_cabi_undefined_flags} -framework AVFoundation -framework AudioToolbox -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework Foundation -framework Security -liconv -lbz2 -lz",
   }
 end

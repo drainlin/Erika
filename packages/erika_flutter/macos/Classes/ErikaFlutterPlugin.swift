@@ -338,7 +338,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case viewNotFound(Int64)
   case overlayNotAvailable
   case presenterCreateFailed
-  case erikaStatus(String, Int32)
+  case erikaStatus(String, Int32, String?)
   case libraryLoadFailed(String, String?)
 
   var description: String {
@@ -359,7 +359,10 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
       return "No window-hosted Erika overlay is available."
     case .presenterCreateFailed:
       return "erika_presenter_create returned null."
-    case .erikaStatus(let operation, let status):
+    case .erikaStatus(let operation, let status, let detail):
+      if let detail, !detail.isEmpty {
+        return "\(operation) failed with ErikaStatus \(status): \(detail)"
+      }
       return "\(operation) failed with ErikaStatus \(status)."
     case .libraryLoadFailed(let path, let detail):
       if let detail, !detail.isEmpty {
@@ -1637,7 +1640,11 @@ private final class ErikaPlayerHost {
 
   private func check(_ status: Int32, operation: String) throws {
     if status != 0 {
-      throw ErikaPluginError.erikaStatus(operation, status)
+      throw ErikaPluginError.erikaStatus(
+        operation,
+        status,
+        library.currentEventMessage()
+      )
     }
   }
 }

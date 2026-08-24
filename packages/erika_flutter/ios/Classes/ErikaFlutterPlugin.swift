@@ -380,7 +380,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case viewNotFound(Int64)
   case overlayNotAvailable
   case presenterCreateFailed
-  case erikaStatus(String, Int32)
+  case erikaStatus(String, Int32, String?)
   case libraryLoadFailed(String, String?)
 
   var description: String {
@@ -401,7 +401,10 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
       return "No window-hosted Erika overlay is available."
     case .presenterCreateFailed:
       return "erika_presenter_create returned null."
-    case .erikaStatus(let operation, let status):
+    case .erikaStatus(let operation, let status, let detail):
+      if let detail, !detail.isEmpty {
+        return "\(operation) failed with ErikaStatus \(status): \(detail)"
+      }
       return "\(operation) failed with ErikaStatus \(status)."
     case .libraryLoadFailed(let path, let detail):
       if let detail, !detail.isEmpty {
@@ -415,6 +418,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
 private final class ErikaNativeLibrary {
   typealias CreateFn = @convention(c) () -> UnsafeMutableRawPointer?
   typealias CreateWithOutputModeFn = @convention(c) (Int32, Float) -> UnsafeMutableRawPointer?
+  typealias CreateWithPlaybackOptionsFn = @convention(c) (Int32, Float, UInt64) -> UnsafeMutableRawPointer?
   typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias OpenWithHeadersFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UInt) -> Int32
@@ -492,6 +496,7 @@ private final class ErikaNativeLibrary {
 
   let create: CreateFn
   let createWithOutputMode: CreateWithOutputModeFn?
+  let createWithPlaybackOptions: CreateWithPlaybackOptionsFn
   let destroy: DestroyFn
   let open: OpenFn
   let openWithHeaders: OpenWithHeadersFn?
@@ -562,6 +567,11 @@ private final class ErikaNativeLibrary {
 
     create = try Self.load("erika_presenter_create", from: libraryHandle, as: CreateFn.self)
     createWithOutputMode = Self.loadOptional("erika_presenter_create_with_output_mode", from: libraryHandle, as: CreateWithOutputModeFn.self)
+    createWithPlaybackOptions = try Self.load(
+      "erika_presenter_create_with_playback_options",
+      from: libraryHandle,
+      as: CreateWithPlaybackOptionsFn.self
+    )
     destroy = try Self.load("erika_presenter_destroy", from: libraryHandle, as: DestroyFn.self)
     open = try Self.load("erika_presenter_open", from: libraryHandle, as: OpenFn.self)
     openWithHeaders = Self.loadOptional("erika_presenter_open_with_headers", from: libraryHandle, as: OpenWithHeadersFn.self)
@@ -674,11 +684,15 @@ private final class ErikaNativeLibrary {
     return unsafeBitCast(raw, to: type)
   }
 
-  func createPresenter(config: ErikaPresenterConfigC) -> UnsafeMutableRawPointer? {
-    if let createWithOutputMode {
-      return createWithOutputMode(config.outputMode, config.edrHeadroom)
-    }
-    return create()
+  func createPresenter(
+    config: ErikaPresenterConfigC,
+    bufferRecoveryAudioMicros: UInt64
+  ) -> UnsafeMutableRawPointer? {
+    createWithPlaybackOptions(
+      config.outputMode,
+      config.edrHeadroom,
+      bufferRecoveryAudioMicros
+    )
   }
 
   func currentEventMessage() -> String? {
@@ -727,7 +741,8 @@ private final class ErikaPlayerHost {
     library: ErikaNativeLibrary,
     config: ErikaPresenterConfigC,
     hdrDebug: Bool,
-    allowBackgroundPlayback: Bool
+    allowBackgroundPlayback: Bool,
+    bufferRecoveryAudioMicros: UInt64
   ) throws {
     self.id = id
     self.library = library
@@ -738,13 +753,16 @@ private final class ErikaPlayerHost {
       qos: .userInteractive
     )
     presenterConfig = config
-    guard let handle = library.createPresenter(config: config) else {
+    guard let handle = library.createPresenter(
+      config: config,
+      bufferRecoveryAudioMicros: bufferRecoveryAudioMicros
+    ) else {
       throw ErikaPluginError.presenterCreateFailed
     }
     self.handle = handle
     erikaHdrLog(
       hdrDebug,
-      "created presenter player=\(id) mode=\(erikaOutputModeLabel(config)) library=\(library.path) createWithOutputMode=\(library.createWithOutputMode != nil)"
+      "created presenter player=\(id) mode=\(erikaOutputModeLabel(config)) library=\(library.path) bufferRecoveryAudioMicros=\(bufferRecoveryAudioMicros)"
     )
   }
 
@@ -894,6 +912,10 @@ private final class ErikaPlayerHost {
     if !allowBackgroundPlayback && isPlaying {
       try? pause()
     }
+  }
+
+  func resumeFromBackground() {
+    setAppInBackground(false)
   }
 
   func setVolume(_ volume: Double) throws {
@@ -1638,7 +1660,11 @@ private final class ErikaPlayerHost {
 
   private func check(_ status: Int32, operation: String) throws {
     if status != 0 {
-      throw ErikaPluginError.erikaStatus(operation, status)
+      throw ErikaPluginError.erikaStatus(
+        operation,
+        status,
+        library.currentEventMessage()
+      )
     }
   }
 
@@ -1984,6 +2010,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private var views: [Int64: WeakErikaVideoPlatformViewBox] = [:]
   private var nextPlayerId: Int64 = 1
   private var pollTimer: Timer?
+  private var pendingOpenCount = 0
   private var activePlayerId: Int64?
   private var interruptedPlayerId: Int64?
   private var notificationObservers: [NSObjectProtocol] = []
@@ -2035,8 +2062,33 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         } else {
           host.clearMediaMetadata()
         }
-        try host.open(uri: uri, httpHeaders: headers)
-        result(nil)
+        // Network/container probing can take several seconds for remote MKV
+        // files. Flutter invokes this handler on the platform thread, so a
+        // synchronous open freezes every Flutter frame. Pause the main-runloop
+        // poller, open on a worker, then complete the channel call on main.
+        pendingOpenCount += 1
+        pollTimer?.invalidate()
+        pollTimer = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+          let openError: Error?
+          do {
+            try host.open(uri: uri, httpHeaders: headers)
+            openError = nil
+          } catch {
+            openError = error
+          }
+          DispatchQueue.main.async {
+            guard let self else { return }
+            self.pendingOpenCount = max(0, self.pendingOpenCount - 1)
+            self.startPollTimerIfNeeded()
+            if let openError {
+              result(self.flutterError(openError))
+            } else {
+              result(nil)
+            }
+          }
+        }
+        return
       case "play":
         let host = try playerHost(from: try dictionaryArgs(call.arguments))
         try host.play()
@@ -2554,6 +2606,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     let hdrDebug = boolValue(args?["hdrDebug"]) ??
       boolEnvironmentFlag("ERIKA_HDR_DEBUG", environment: ProcessInfo.processInfo.environment)
     let config = presenterConfigForNewPlayer(arguments: arguments, hdrDebug: hdrDebug)
+    let bufferRecoveryAudioMicros = try requiredUInt64(
+      args?["bufferRecoveryAudioMicros"] ?? 1_500_000,
+      name: "bufferRecoveryAudioMicros"
+    )
     let id = nextPlayerId
     nextPlayerId += 1
     let host = try ErikaPlayerHost(
@@ -2561,11 +2617,14 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       library: library,
       config: config,
       hdrDebug: hdrDebug,
-      allowBackgroundPlayback: boolValue(args?["allowBackgroundPlayback"]) ?? false
+      allowBackgroundPlayback: boolValue(args?["allowBackgroundPlayback"]) ?? false,
+      bufferRecoveryAudioMicros: bufferRecoveryAudioMicros
     )
     host.onNowPlayingChanged = { [weak self] changedHost in
-      guard self?.activePlayerId == changedHost.id else { return }
-      self?.updateNowPlayingInfo(for: changedHost)
+      DispatchQueue.main.async { [weak self] in
+        guard self?.activePlayerId == changedHost.id else { return }
+        self?.updateNowPlayingInfo(for: changedHost)
+      }
     }
     players[id] = host
     systemMediaNavigation[id] = (previousEnabled: false, nextEnabled: false)
@@ -2594,7 +2653,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       object: nil,
       queue: .main
     ) { [weak self] _ in
-      self?.players.values.forEach { $0.setAppInBackground(false) }
+      self?.players.values.forEach { $0.resumeFromBackground() }
     })
     notificationObservers.append(center.addObserver(
       forName: AVAudioSession.interruptionNotification,
@@ -2835,7 +2894,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   }
 
   private func startPollTimerIfNeeded() {
-    guard pollTimer == nil else { return }
+    guard pollTimer == nil, pendingOpenCount == 0 else { return }
     let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
       guard let self else { return }
       let sink = Self.sharedEventSink

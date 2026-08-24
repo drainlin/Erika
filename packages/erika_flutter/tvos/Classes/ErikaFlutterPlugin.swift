@@ -2409,6 +2409,14 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     if shouldPlaceWindowOverlayAboveFlutter() {
       return
     }
+    // FlutterViewController owns a separate opacity switch for the engine's
+    // Metal surface. Changing UIView.isOpaque alone leaves that surface
+    // opaque, so transparent Flutter pixels are cleared to white and hide a
+    // sibling video view placed below it.
+    if let window = view.window,
+       let flutterViewController = findFlutterViewController(from: window.rootViewController) {
+      flutterViewController.viewOpaque = false
+    }
     view.isOpaque = false
     view.backgroundColor = .clear
     view.layer.isOpaque = false

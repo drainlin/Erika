@@ -722,6 +722,7 @@ private final class ErikaPlayerHost {
   private let allowBackgroundPlayback: Bool
   private var loggedRenderThread = false
   private var loggedFirstRenderedVideoFrame = false
+  private var overlayAwaitingFirstFrame = false
   private var latestPresenterStats = ErikaPresenterStatsC()
   private var fallbackTimer: DispatchSourceTimer?
   private var renderTickQueued = false
@@ -1428,6 +1429,8 @@ private final class ErikaPlayerHost {
   func attach(view: ErikaMetalSurfaceView) throws {
     attachedView = view
     view.attachedPlayerId = id
+    overlayAwaitingFirstFrame = view is ErikaWindowOverlayView
+    (view as? ErikaWindowOverlayView)?.beginPlayerAttachment(playerId: id)
     try attachOrResize(view: view, attach: true)
     startDisplayLinkIfNeeded()
     updateTickDriver()
@@ -1437,6 +1440,7 @@ private final class ErikaPlayerHost {
     guard viewId == nil || attachedView?.platformViewId == viewId else { return }
     attachedView?.attachedPlayerId = nil
     attachedView = nil
+    overlayAwaitingFirstFrame = false
     displayLink?.invalidate()
     displayLink = nil
     displayLinkProxy = nil
@@ -1476,6 +1480,14 @@ private final class ErikaPlayerHost {
     }
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
+    }
+    if overlayAwaitingFirstFrame && stats.renderedVideoFrames > 0 {
+      overlayAwaitingFirstFrame = false
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        (self.attachedView as? ErikaWindowOverlayView)?
+          .revealAfterFirstFrame(playerId: self.id)
+      }
     }
     if hdrDebug && stats.renderedVideoFrames > 0 {
       let statsSnapshot = stats
@@ -1788,6 +1800,8 @@ private final class ErikaWindowOverlayView: UIView, ErikaMetalSurfaceView {
 
   private var overlayFrameGeneration: Int64?
   private var debugLabelView: UILabel?
+  private var requestedVisible = false
+  private var presentationReady = false
 
   /// Generation of the widget that currently owns this shared overlay surface.
   /// Used to reject stale detach calls from disposed widgets.
@@ -1849,6 +1863,19 @@ private final class ErikaWindowOverlayView: UIView, ErikaMetalSurfaceView {
     plugin?.resizePlayerAttachedToView(viewId: platformViewId)
   }
 
+  func beginPlayerAttachment(playerId: Int64) {
+    attachedPlayerId = playerId
+    requestedVisible = false
+    presentationReady = false
+    isHidden = true
+  }
+
+  func revealAfterFirstFrame(playerId: Int64) {
+    guard attachedPlayerId == playerId else { return }
+    presentationReady = true
+    isHidden = !requestedVisible
+  }
+
   func updateOverlayFrame(
     _ frame: CGRect?,
     visible: Bool,
@@ -1867,6 +1894,7 @@ private final class ErikaWindowOverlayView: UIView, ErikaMetalSurfaceView {
     let shouldShow = visible &&
       (frame?.width ?? 0) > 0 &&
       (frame?.height ?? 0) > 0
+    requestedVisible = shouldShow
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
@@ -1881,7 +1909,7 @@ private final class ErikaWindowOverlayView: UIView, ErikaMetalSurfaceView {
     if self.frame != resolvedFrame {
       self.frame = resolvedFrame
     }
-    isHidden = false
+    isHidden = !presentationReady
     updateDrawableSize()
     plugin?.resizePlayerAttachedToView(viewId: platformViewId)
   }
@@ -2368,6 +2396,9 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
         let overlay = try ensureWindowOverlayInstalled()
+        for otherHost in players.values where otherHost.id != host.id {
+          otherHost.detach(viewId: overlay.platformViewId)
+        }
         try host.attach(view: overlay)
         result(erikaWindowHostedVideoSurfaceId)
       case "detachOverlay":

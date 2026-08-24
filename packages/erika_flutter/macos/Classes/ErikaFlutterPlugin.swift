@@ -712,6 +712,7 @@ private final class ErikaPlayerHost {
   private var displayTimer: Timer?
   private var displayTimerFps: Double = 0.0
   private var loggedRenderThread = false
+  private var overlayAwaitingFirstFrame = false
   private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
   private var currentDanmakuConfig = ErikaDanmakuConfigC()
   private var latestPresenterStats = ErikaPresenterStatsC()
@@ -1384,6 +1385,8 @@ private final class ErikaPlayerHost {
     attachedView = view
     attachedViewId = view.platformViewId
     view.attachedPlayerId = id
+    overlayAwaitingFirstFrame = view is ErikaWindowOverlayView
+    (view as? ErikaWindowOverlayView)?.beginPlayerAttachment(playerId: id)
     erikaWindowOverlayTrace(
       "attach player=\(id) surface=\(view.platformViewId) " +
       "window=\((view as? NSView)?.window?.windowNumber ?? -1) " +
@@ -1400,6 +1403,7 @@ private final class ErikaPlayerHost {
     attachedView?.attachedPlayerId = nil
     attachedView = nil
     attachedViewId = nil
+    overlayAwaitingFirstFrame = false
     stopDisplayDriver()
     withNativeCall {
       _ = library.detachSurface(handle)
@@ -1438,6 +1442,14 @@ private final class ErikaPlayerHost {
     }
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
+    }
+    if overlayAwaitingFirstFrame && stats.renderedVideoFrames > 0 {
+      overlayAwaitingFirstFrame = false
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        (self.attachedView as? ErikaWindowOverlayView)?
+          .revealAfterFirstFrame(playerId: self.id)
+      }
     }
   }
 
@@ -1959,6 +1971,8 @@ final class ErikaWindowOverlayView: NSView, ErikaMetalSurfaceView {
 
   private var overlayFrameGeneration: Int64?
   private var lastTraceSignature: String?
+  private var requestedVisible = false
+  private var presentationReady = false
 
   /// Generation of the widget that currently owns this shared overlay surface.
   /// Used to reject stale detach calls from disposed widgets.
@@ -2023,6 +2037,19 @@ final class ErikaWindowOverlayView: NSView, ErikaMetalSurfaceView {
     plugin?.resizePlayerAttachedToView(viewId: platformViewId)
   }
 
+  func beginPlayerAttachment(playerId: Int64) {
+    attachedPlayerId = playerId
+    requestedVisible = false
+    presentationReady = false
+    isHidden = true
+  }
+
+  func revealAfterFirstFrame(playerId: Int64) {
+    guard attachedPlayerId == playerId else { return }
+    presentationReady = true
+    isHidden = !requestedVisible
+  }
+
   func updateOverlayFrame(_ frame: CGRect?, visible: Bool, debugLabel: String?, generation: Int64?) {
     if visible {
       overlayFrameGeneration = generation
@@ -2036,6 +2063,7 @@ final class ErikaWindowOverlayView: NSView, ErikaMetalSurfaceView {
     let shouldShow = visible &&
       (frame?.width ?? 0) > 0 &&
       (frame?.height ?? 0) > 0
+    requestedVisible = shouldShow
     if erikaWindowOverlayTraceEnabled {
       let signature =
         "\(window?.windowNumber ?? -1)|\(visible)|\(generation ?? -1)|\(String(describing: frame))"
@@ -2061,7 +2089,7 @@ final class ErikaWindowOverlayView: NSView, ErikaMetalSurfaceView {
     if self.frame != resolvedFrame {
       self.frame = resolvedFrame
     }
-    isHidden = false
+    isHidden = !presentationReady
     updateDrawableSize()
     plugin?.resizePlayerAttachedToView(viewId: platformViewId)
   }
@@ -2529,6 +2557,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           "secondary=\(requestedSecondaryWindow) targetWindow=\(installation.hostWindow.windowNumber)"
         )
         let overlay = installation.overlay
+        for otherHost in players.values where otherHost.id != host.id {
+          otherHost.detach(viewId: overlay.platformViewId)
+          windowOverlayPlayerIds.remove(otherHost.id)
+        }
         try host.attach(view: overlay)
         windowOverlayPlayerIds.insert(host.id)
         result(erikaWindowHostedVideoSurfaceId)

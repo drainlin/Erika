@@ -1090,7 +1090,7 @@ struct ErikaFlutterPlugin::ErikaOverlayWindow {
       SetWindowTextW(hwnd, Utf8ToWide(*debug_label).c_str());
     }
 
-    if (!visible) {
+    if (!visible || !presentation_ready) {
       ShowWindow(hwnd, SW_HIDE);
       return;
     }
@@ -1106,6 +1106,21 @@ struct ErikaFlutterPlugin::ErikaOverlayWindow {
     const HWND insert_after = host != nullptr ? host : HWND_BOTTOM;
     SetWindowPos(hwnd, insert_after, px, py, pw, ph,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  }
+
+  void BeginPlayerAttachment(int64_t player_id) {
+    owner_player_id = player_id;
+    visible = false;
+    presentation_ready = false;
+    ShowWindow(hwnd, SW_HIDE);
+  }
+
+  void RevealAfterFirstFrame(int64_t player_id) {
+    if (owner_player_id != player_id || presentation_ready) {
+      return;
+    }
+    presentation_ready = true;
+    RefreshScaleAndReposition();
   }
 
   uint32_t PixelWidth() const {
@@ -1172,6 +1187,7 @@ struct ErikaFlutterPlugin::ErikaOverlayWindow {
   double logical_width = 1.0;
   double logical_height = 1.0;
   bool visible = false;
+  bool presentation_ready = false;
   int64_t active_generation = 0;
   int64_t owner_player_id = 0;
 };
@@ -1786,6 +1802,10 @@ struct ErikaFlutterPlugin::PlayerHost {
     PollEvents(event_sink);
   }
 
+  bool HasRenderedVideoFrame() const {
+    return latest_presenter_stats.rendered_video_frames > 0;
+  }
+
   void PollEvents(flutter::EventSink<EncodableValue>* event_sink) {
     while (true) {
       ErikaEvent event{};
@@ -2343,6 +2363,11 @@ void ErikaFlutterPlugin::OnFrameTimer() {
   const auto tick_started = std::chrono::steady_clock::now();
   for (auto& entry : players_) {
     entry.second->RenderTick(event_sink_.get());
+    if (overlay_window_ &&
+        overlay_window_->owner_player_id == entry.first &&
+        entry.second->HasRenderedVideoFrame()) {
+      overlay_window_->RevealAfterFirstFrame(entry.first);
+    }
   }
   RefreshSmtc();
   if (trace_enabled) {
@@ -2833,8 +2858,14 @@ void ErikaFlutterPlugin::HandleMethodCall(
                           " was not found.");
       }
       auto& overlay = EnsureOverlayWindow();
+      overlay.BeginPlayerAttachment(host.id);
+      for (auto& entry : players_) {
+        if (entry.first != host.id &&
+            entry.second->attached_view_id == kWindowOverlayViewId) {
+          entry.second->Detach(kWindowOverlayViewId);
+        }
+      }
       host.AttachOverlay(overlay);
-      overlay.owner_player_id = host.id;
       OnFrameTimer();
       result->Success();
     } else if (method == "detachView") {
@@ -2845,8 +2876,14 @@ void ErikaFlutterPlugin::HandleMethodCall(
       auto& host = PlayerFromArgs(args);
       UpdateOverlayTarget(args);
       auto& overlay = EnsureOverlayWindow();
+      overlay.BeginPlayerAttachment(host.id);
+      for (auto& entry : players_) {
+        if (entry.first != host.id &&
+            entry.second->attached_view_id == kWindowOverlayViewId) {
+          entry.second->Detach(kWindowOverlayViewId);
+        }
+      }
       host.AttachOverlay(overlay);
-      overlay.owner_player_id = host.id;
       OnFrameTimer();
       result->Success(EncodableValue(kWindowOverlayViewId));
     } else if (method == "detachOverlay") {

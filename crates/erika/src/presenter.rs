@@ -69,11 +69,18 @@ use crate::{PlayerError, Result};
 const AUDIO_START_BUFFER: Duration = Duration::from_millis(250);
 const AUDIO_PUMP_FRAME_LIMIT: usize = 16;
 const AUDIO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-const AUDIO_FAST_RATE_PUMP_FRAME_LIMIT: usize = 48;
-const AUDIO_FAST_RATE_PUMP_TIME_BUDGET: Duration = Duration::from_millis(8);
+// The audio transform currently runs on the display-driven presenter path.
+// Keep a rate-change refill bounded to one normal audio-pump slice so it
+// cannot consume an entire render frame while SoundTouch is warming up.
+const AUDIO_FAST_RATE_PUMP_FRAME_LIMIT: usize = 24;
+const AUDIO_FAST_RATE_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 const PLAYBACK_RATE_EPSILON: f64 = 0.001;
 const VIDEO_PUMP_FRAME_LIMIT: usize = 8;
 const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
+// A foreground resume that keeps failing must not retry once per display
+// frame: every attempt crosses the playback worker channel and can block the
+// render queue on the frame-output barrier timeout.
+const MAX_VIDEO_DECODE_RESUME_ATTEMPTS: u32 = 5;
 const DANMAKU_PLAN_REQUEST_QUANTUM: Duration = Duration::from_millis(250);
 const DANMAKU_PREPARE_REFRESH_MARGIN: Duration = Duration::from_secs(4);
 const DANMAKU_PLAN_LOOKAHEAD: Duration = Duration::from_secs(8);
@@ -288,7 +295,10 @@ pub struct PresenterRuntime {
     last_audio_clock_report: Option<AudioClockReportState>,
     last_audio_runtime_stats: AudioOutputRuntimeStats,
     playback_rate: f64,
+    pending_playback_rate: Option<PendingPlaybackRate>,
     audio_only_tick_active: bool,
+    resume_pending: bool,
+    video_decode_resume_attempts: u32,
     latest_video_decoder: Option<VideoDecoderEvent>,
     current_overlay: Option<OverlayFrame>,
     debug_hud: DebugHud,
@@ -360,6 +370,12 @@ struct AudioClockReportState {
     underflow_frames: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPlaybackRate {
+    rate: f64,
+    commit_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DanmakuPlanKey {
     media_time: Duration,
@@ -390,7 +406,7 @@ struct AsyncDanmakuPlannerState {
     config: DanmakuLayoutConfig,
     rasterizer: DanmakuTextRasterizer,
     latest_request: Option<AsyncDanmakuPlanRequest>,
-    invalidate_stable_tracks: bool,
+    invalidate_placement_history: bool,
     shutdown: bool,
 }
 
@@ -398,6 +414,8 @@ struct AsyncDanmakuPlanner {
     shared: Arc<(Mutex<AsyncDanmakuPlannerState>, Condvar)>,
     results: Receiver<AsyncDanmakuPlanResult>,
     last_requested: Option<DanmakuPlanKey>,
+    #[cfg(target_os = "windows")]
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -423,13 +441,13 @@ impl AsyncDanmakuPlanner {
             config,
             rasterizer,
             latest_request: None,
-            invalidate_stable_tracks: false,
+            invalidate_placement_history: false,
             shutdown: false,
         };
         let shared = Arc::new((Mutex::new(state), Condvar::new()));
         let (result_tx, results) = crossbeam_channel::unbounded();
         let worker_shared = Arc::clone(&shared);
-        thread::Builder::new()
+        let _worker = thread::Builder::new()
             .name("erika-danmaku".to_string())
             .spawn(move || run_async_danmaku_planner(worker_shared, result_tx, engine))
             .expect("spawn erika danmaku planner");
@@ -437,6 +455,8 @@ impl AsyncDanmakuPlanner {
             shared,
             results,
             last_requested: None,
+            #[cfg(target_os = "windows")]
+            worker: Some(_worker),
         }
     }
 
@@ -516,7 +536,7 @@ impl AsyncDanmakuPlanner {
         if let Some(timeline) = timeline {
             if state.timeline != timeline {
                 state.timeline = timeline;
-                state.invalidate_stable_tracks = true;
+                state.invalidate_placement_history = true;
             }
         }
         if let Some(config) = config {
@@ -531,11 +551,20 @@ impl AsyncDanmakuPlanner {
 
 impl Drop for AsyncDanmakuPlanner {
     fn drop(&mut self) {
-        let (lock, cvar) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.shutdown = true;
-        state.revision = state.revision.saturating_add(1);
-        cvar.notify_one();
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown = true;
+            state.revision = state.revision.saturating_add(1);
+            cvar.notify_one();
+        }
+        // The Windows plugin unloads the native DLL after the last presenter.
+        // A shutdown notification alone leaves the worker executing (or even
+        // starting) in unmapped code. Release the state lock before joining.
+        #[cfg(target_os = "windows")]
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -677,7 +706,10 @@ impl PresenterRuntime {
             last_audio_clock_report: None,
             last_audio_runtime_stats: AudioOutputRuntimeStats::default(),
             playback_rate: 1.0,
+            pending_playback_rate: None,
             audio_only_tick_active: false,
+            resume_pending: false,
+            video_decode_resume_attempts: 0,
             latest_video_decoder: None,
             current_overlay: None,
             debug_hud: DebugHud::new(),
@@ -737,6 +769,29 @@ impl PresenterRuntime {
         self.renderer.detach_surface()
     }
 
+    /// Borrowed COM identity of a DirectComposition swap chain. No `AddRef`.
+    ///
+    /// Compare this pointer across frames. Only call
+    /// [`Self::composition_swapchain_iunknown`] when transferring a reference
+    /// into `IDCompositionVisual::SetContent`.
+    pub fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        self.renderer.composition_swapchain_ptr()
+    }
+
+    /// AddRef'd `IUnknown` for a DirectComposition `SetContent` swap chain.
+    ///
+    /// The caller owns the reference and must `Release` it (for example by
+    /// wrapping it in a host `DcompContent`).
+    pub fn composition_swapchain_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        self.renderer.composition_swapchain_iunknown()
+    }
+
+    /// AddRef'd `IUnknown` for the renderer-owned Windows Flutter texture.
+    /// The caller owns the returned reference.
+    pub fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        self.renderer.windows_flutter_texture_iunknown()
+    }
+
     pub fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
         let metrics = SurfaceMetrics::new(width, height, scale);
         let previous_metrics = self.current_surface_metrics;
@@ -787,22 +842,29 @@ impl PresenterRuntime {
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
         self.quiesce_frame_output("open")?;
-        self.reset_audio_output();
+        self.reset_video_decode_resume_state();
+        self.reset_audio_output_with_committed_rate();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
         let result = self.player.open(media);
+        let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
+            self.player.set_playback_rate(self.playback_rate)
+        } else {
+            Ok(())
+        };
         // Player::open joins the previous producer before returning, so this
         // second drain deterministically removes anything it emitted between
         // the first drain and shutdown. The new engine is still paused.
         self.drain_pending_player_frames();
-        result
+        result.and(rate_result)
     }
 
     pub fn play(&mut self) -> Result<()> {
         if self.player.is_stopped_at_end() {
-            self.reset_audio_output();
+            self.cancel_pending_video_decode_resume();
+            self.reset_audio_output_with_committed_rate();
             self.drain_pending_player_frames();
             self.bump_danmaku_generation();
             self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
@@ -812,6 +874,16 @@ impl PresenterRuntime {
 
     pub fn pause(&mut self) -> Result<()> {
         let result = self.player.pause();
+        if self.pending_playback_rate.is_some() {
+            // A pending transition is measured against wall time while the
+            // output is running. Pausing that output would otherwise leave the
+            // old-rate bridge queued but allow the stale deadline to commit on
+            // the next play. Flush the bridge and commit the requested rate
+            // while the clock is parked.
+            self.reset_audio_output();
+            let rate_result = self.commit_pending_playback_rate_now();
+            return result.and(rate_result);
+        }
         if let Err(error) = self.audio_output.pause() {
             self.stats.audio_failures += 1;
             eprintln!("Erika presenter audio pause failed: {error}");
@@ -836,7 +908,8 @@ impl PresenterRuntime {
     pub fn stop(&mut self) -> Result<()> {
         let quiesced = self.quiesce_frame_output("stop")?;
         let result = self.player.stop();
-        self.reset_audio_output();
+        self.cancel_pending_video_decode_resume();
+        self.reset_audio_output_with_committed_rate();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
         let transition = self.finish_frame_output_transition("stop", quiesced, true);
@@ -845,7 +918,8 @@ impl PresenterRuntime {
 
     pub fn close(&mut self) -> Result<()> {
         self.quiesce_frame_output("close")?;
-        self.reset_audio_output();
+        self.reset_video_decode_resume_state();
+        self.reset_audio_output_with_committed_rate();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
         self.drain_pending_player_frames();
@@ -859,19 +933,53 @@ impl PresenterRuntime {
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         let quiesced = self.quiesce_frame_output("seek")?;
         let result = self.player.seek(position);
+        let rate_result = self.commit_pending_playback_rate_now();
         self.reset_audio_output();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(position, TransitionFramePolicy::PreserveRendererSnapshot);
         let transition = self.finish_frame_output_transition("seek", quiesced, true);
-        result.and(transition)
+        result.and(rate_result).and(transition)
     }
 
     pub fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
         let next_rate = normalize_playback_rate(rate);
-        self.player.set_playback_rate(next_rate)?;
-        self.playback_rate = next_rate;
+        if playback_rate_request_is_idempotent(
+            self.playback_rate,
+            self.pending_playback_rate,
+            next_rate,
+        ) {
+            return Ok(());
+        }
+        self.player.invalidate_audio_clock();
         self.audio_output.set_playback_rate(next_rate);
         self.last_audio_clock_report = None;
+
+        let bridge = audio_transition_bridge(
+            self.audio_output.clock_snapshot(),
+            self.audio_output.queued_output_duration(),
+        );
+        if self.is_playing()
+            && let Some(bridge) = bridge
+        {
+            self.pending_playback_rate = Some(PendingPlaybackRate {
+                rate: next_rate,
+                commit_at: Instant::now() + bridge,
+            });
+            return Ok(());
+        }
+
+        // A paused output keeps its queued PCM. Discard it before committing a
+        // new rate so a later resume cannot play old-rate samples while the
+        // player clock is already running at the new rate.
+        if !self.is_playing() && bridge.is_some() {
+            self.reset_audio_output();
+        }
+        if let Err(error) = self.player.set_playback_rate(next_rate) {
+            self.audio_output.set_playback_rate(self.playback_rate);
+            return Err(error);
+        }
+        self.playback_rate = next_rate;
+        self.pending_playback_rate = None;
         Ok(())
     }
 
@@ -1230,6 +1338,7 @@ impl PresenterRuntime {
     pub fn select_audio_track(&mut self, track_id: Option<i64>) -> Result<()> {
         let quiesced = self.quiesce_frame_output("select_audio_track")?;
         let result = self.player.select_audio_track(track_id);
+        let rate_result = self.commit_pending_playback_rate_now();
         self.reset_audio_output();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(
@@ -1237,12 +1346,13 @@ impl PresenterRuntime {
             TransitionFramePolicy::PreserveTrackSwitchFrame,
         );
         let transition = self.finish_frame_output_transition("select_audio_track", quiesced, true);
-        result.and(transition)
+        result.and(rate_result).and(transition)
     }
 
     pub fn select_subtitle_track(&mut self, track_id: Option<i64>) -> Result<()> {
         let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
         let result = self.player.select_subtitle_track(track_id);
+        let rate_result = self.commit_pending_playback_rate_now();
         self.reset_audio_output();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(
@@ -1251,7 +1361,7 @@ impl PresenterRuntime {
         );
         let transition =
             self.finish_frame_output_transition("select_subtitle_track", quiesced, true);
-        result.and(transition)
+        result.and(rate_result).and(transition)
     }
 
     pub fn tracks(&self) -> Vec<TrackInfo> {
@@ -1264,11 +1374,32 @@ impl PresenterRuntime {
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
         if self.audio_only_tick_active {
-            self.discard_pending_video_frames();
-            self.player.set_video_decode_suspended(false)?;
-            self.audio_only_tick_active = false;
+            if self.resume_pending {
+                self.try_resume_video_decode();
+            } else if self.video_decode_resume_attempts < MAX_VIDEO_DECODE_RESUME_ATTEMPTS {
+                // Returning to the foreground can race the layer's first
+                // drawable. Arm the resume on this tick and let a later tick
+                // perform the decoder seek/flush after the surface is ready.
+                self.discard_pending_video_frames();
+                self.resume_pending = true;
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "player_video_decode",
+                        "stage": "resume_pending",
+                        "reason": "foreground_render_tick",
+                    })
+                    .to_string(),
+                );
+            }
+            // Once the attempt budget is spent the resume stays disarmed until
+            // the next background tick opens a new foreground window, so a
+            // wedged worker cannot be re-probed on every display frame.
+        } else {
+            self.resume_pending = false;
+            self.video_decode_resume_attempts = 0;
         }
         let tick_started = Instant::now();
+        self.commit_pending_playback_rate()?;
         let pump_started = Instant::now();
         self.refresh_video_decoder_status();
 
@@ -1366,6 +1497,13 @@ impl PresenterRuntime {
                 self.current_surface_metrics
                     .map_or(0, |metrics| metrics.physical_extent.height),
             );
+        if self.resume_pending && !self.surface_is_ready() {
+            self.last_render_duration = Duration::ZERO;
+            self.last_render_current_duration = Duration::ZERO;
+            self.last_render_test_duration = Duration::ZERO;
+            self.last_tick_duration = tick_started.elapsed();
+            return Ok(self.stats);
+        }
         let render_started = Instant::now();
         let render_result = self.renderer.render_current_frame(context);
         self.last_render_current_duration = render_started.elapsed();
@@ -1441,6 +1579,12 @@ impl PresenterRuntime {
 
     pub fn audio_only_tick(&mut self) -> Result<PresenterStats> {
         let tick_started = Instant::now();
+        self.commit_pending_playback_rate()?;
+        // A background tick starts a new foreground-resume window. If a
+        // previous foreground attempt failed, do not carry its pending flag or
+        // its spent attempt budget into the next foreground frame.
+        self.resume_pending = false;
+        self.video_decode_resume_attempts = 0;
         if !self.audio_only_tick_active {
             self.player.set_video_decode_suspended(true)?;
             self.discard_pending_video_frames();
@@ -1468,6 +1612,103 @@ impl PresenterRuntime {
 
     fn discard_pending_video_frames(&self) {
         while self.video_frames.try_recv().is_ok() {}
+    }
+
+    /// Clears the resume bookkeeping across a boundary that replaces or
+    /// retires the playback engine.
+    ///
+    /// `open` builds a fresh engine and `close` retires the worker, and a new
+    /// engine starts with video decode running, so the presenter owes it no
+    /// resume.
+    fn reset_video_decode_resume_state(&mut self) {
+        self.audio_only_tick_active = false;
+        self.resume_pending = false;
+        self.video_decode_resume_attempts = 0;
+    }
+
+    /// Drops an in-flight resume attempt without forgetting that the worker
+    /// still has video decode suspended.
+    ///
+    /// `stop` and a stopped-at-end replay reuse the current engine, and
+    /// neither clears its `video_decode_suspended` flag. Clearing
+    /// `audio_only_tick_active` here would desynchronize the presenter from
+    /// the worker: no later foreground tick would owe a resume, so playback
+    /// would stay audio-only with a frozen frame until the app is backgrounded
+    /// again. Resetting the budget lets the next foreground window retry from
+    /// scratch.
+    fn cancel_pending_video_decode_resume(&mut self) {
+        self.resume_pending = false;
+        self.video_decode_resume_attempts = 0;
+    }
+
+    fn surface_is_ready(&self) -> bool {
+        let Some(metrics) = self.current_surface_metrics else {
+            return false;
+        };
+        let renderer = self.renderer.runtime_stats();
+        metrics.physical_extent.width > 0
+            && metrics.physical_extent.height > 0
+            && renderer.attached
+            && renderer.surface_width > 0
+            && renderer.surface_height > 0
+    }
+
+    fn try_resume_video_decode(&mut self) {
+        if !self.surface_is_ready() {
+            return;
+        }
+
+        self.discard_pending_video_frames();
+        match self.player.set_video_decode_suspended(false) {
+            Ok(_) => {
+                self.audio_only_tick_active = false;
+                self.resume_pending = false;
+                self.video_decode_resume_attempts = 0;
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "player_video_decode",
+                        "stage": "resumed_at_keyframe",
+                    })
+                    .to_string(),
+                );
+            }
+            Err(error) => self.note_video_decode_resume_failure(&error.to_string()),
+        }
+    }
+
+    /// Accounts for one failed foreground resume and decides whether the next
+    /// display tick may try again.
+    ///
+    /// A worker timeout or transient lifecycle race must not turn the render
+    /// loop into a terminal C ABI error, so the attempt is retried instead of
+    /// propagated. The budget bounds that retry: a disconnected or hung
+    /// playback worker never recovers, and probing it on every display frame
+    /// would send one IPC command and one seek/flush per frame while each
+    /// attempt can stall the render queue for the frame-output barrier
+    /// timeout.
+    fn note_video_decode_resume_failure(&mut self, reason: &str) {
+        self.video_decode_resume_attempts = self.video_decode_resume_attempts.saturating_add(1);
+        let exhausted = self.video_decode_resume_attempts >= MAX_VIDEO_DECODE_RESUME_ATTEMPTS;
+        if exhausted {
+            // Leave the decoder suspended and keep rendering the last frame
+            // with audio; a later background/foreground cycle reopens the
+            // window with a fresh budget.
+            self.resume_pending = false;
+        }
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "player_video_decode",
+                "stage": if exhausted {
+                    "resume_abandoned"
+                } else {
+                    "resume_retry_pending"
+                },
+                "reason": reason,
+                "attempt": self.video_decode_resume_attempts,
+                "maxAttempts": MAX_VIDEO_DECODE_RESUME_ATTEMPTS,
+            })
+            .to_string(),
+        );
     }
 
     fn debug_hud_snapshot(&self) -> DebugHudSnapshot {
@@ -1585,6 +1826,26 @@ impl PresenterRuntime {
         self.renderer
             .capture_current_frame(context, width, height)
             .map(|capture| capture.map(|capture| capture.rgba))
+    }
+
+    /// Selects the external Flutter texture written by the next render tick.
+    ///
+    /// The platform plugin owns the texture and keeps it alive for the entire
+    /// call. The renderer retains the native object until another buffer is
+    /// selected or the surface is detached.
+    pub fn set_flutter_texture_buffer(
+        &mut self,
+        raw_texture: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if raw_texture == 0 || width == 0 || height == 0 {
+            return Err(PlayerError::Renderer(
+                "Flutter texture buffer and dimensions must be non-zero".to_string(),
+            ));
+        }
+        self.renderer
+            .set_flutter_texture_buffer(raw_texture, width, height)
     }
 
     fn capture_overlay(&mut self, width: u32, height: u32) -> OverlayFrame {
@@ -2723,6 +2984,9 @@ impl PresenterRuntime {
             if pumped >= frame_limit || started.elapsed() >= time_budget {
                 break;
             }
+            if !self.audio_output.can_accept_audio_frame() {
+                break;
+            }
             match self.audio_frames.try_recv() {
                 Ok(frame) => {
                     if frame.generation != self.player.playback_generation() {
@@ -2742,20 +3006,29 @@ impl PresenterRuntime {
     }
 
     fn audio_pump_limits(&self) -> (usize, Duration) {
-        if (self.playback_rate - 1.0).abs() > PLAYBACK_RATE_EPSILON {
-            (
-                AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
-                AUDIO_FAST_RATE_PUMP_TIME_BUDGET,
-            )
-        } else {
-            (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
-        }
+        let rate = self
+            .pending_playback_rate
+            .map_or(self.playback_rate, |pending| pending.rate);
+        audio_pump_limits_for_rate(rate)
     }
 
     fn report_audio_clock_snapshot(&mut self) {
-        let Some(snapshot) = self.audio_output.clock_snapshot() else {
+        // During a rate transition the audio ring already uses the requested
+        // rate while the player clock still uses the old one. Do not enqueue a
+        // mixed-rate clock sample; the first sample after commit is coherent.
+        if self.pending_playback_rate.is_some() {
+            return;
+        }
+        // configure/start/push can recover the device during this pump. Publish
+        // its new epoch before sampling, not only after feedback is enqueued.
+        self.report_audio_output_runtime_stats();
+        let Some(observation) = self
+            .player
+            .capture_audio_clock(|| self.audio_output.clock_snapshot())
+        else {
             return;
         };
+        let snapshot = observation.snapshot();
         // Report queue/underflow movement even when the engine later rejects the clock for sync.
         if !self.should_report_audio_clock(snapshot) {
             return;
@@ -2769,7 +3042,7 @@ impl PresenterRuntime {
             snapshot.written_frames,
             snapshot.underflow_frames,
         ));
-        let _ = self.player.update_audio_clock(snapshot);
+        let _ = self.player.update_audio_clock_observation(observation);
     }
 
     fn should_report_audio_clock(&mut self, snapshot: AudioClockSnapshot) -> bool {
@@ -2796,6 +3069,7 @@ impl PresenterRuntime {
 
     fn push_audio(&mut self, frame: PlayerAudioFrame) {
         if !self.audio_configured {
+            self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
                 eprintln!("Erika presenter audio configure failed: {error}");
@@ -2845,6 +3119,7 @@ impl PresenterRuntime {
     }
 
     fn reset_audio_output(&mut self) {
+        self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
             eprintln!("Erika presenter audio reset failed: {error}");
@@ -2854,11 +3129,44 @@ impl PresenterRuntime {
         self.last_audio_clock_report = None;
     }
 
+    fn reset_audio_output_with_committed_rate(&mut self) {
+        self.pending_playback_rate = None;
+        self.reset_audio_output();
+        self.audio_output.set_playback_rate(self.playback_rate);
+    }
+
+    fn commit_pending_playback_rate(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_playback_rate else {
+            return Ok(());
+        };
+        if !self.is_playing() || Instant::now() < pending.commit_at {
+            return Ok(());
+        }
+        self.commit_pending_playback_rate_now()
+    }
+
+    fn commit_pending_playback_rate_now(&mut self) -> Result<()> {
+        let Some(rate) = self.pending_playback_rate.map(|pending| pending.rate) else {
+            return Ok(());
+        };
+        if let Err(error) = self.player.set_playback_rate(rate) {
+            self.reset_audio_output_with_committed_rate();
+            return Err(error);
+        }
+        self.playback_rate = rate;
+        self.pending_playback_rate = None;
+        self.player.invalidate_audio_clock();
+        self.last_audio_clock_report = None;
+        Ok(())
+    }
+
     fn report_audio_output_runtime_stats(&mut self) {
         let stats = self.audio_output.runtime_stats();
         if stats.transition_sequence == self.last_audio_runtime_stats.transition_sequence {
             return;
         }
+        self.player.invalidate_audio_clock();
+        self.last_audio_clock_report = None;
         self.last_audio_runtime_stats = stats;
         let event = AudioOutputEvent { stats };
         trace::diagnostic(event.structured_message());
@@ -2881,6 +3189,40 @@ fn normalize_playback_rate(rate: f64) -> f64 {
         rate
     } else {
         1.0
+    }
+}
+
+fn playback_rate_matches(lhs: f64, rhs: f64) -> bool {
+    (lhs - rhs).abs() <= PLAYBACK_RATE_EPSILON
+}
+
+fn playback_rate_request_is_idempotent(
+    current_rate: f64,
+    pending: Option<PendingPlaybackRate>,
+    next_rate: f64,
+) -> bool {
+    pending.is_some_and(|pending| playback_rate_matches(pending.rate, next_rate))
+        || (pending.is_none() && playback_rate_matches(current_rate, next_rate))
+}
+
+fn audio_transition_bridge(
+    snapshot: Option<AudioClockSnapshot>,
+    queued_output_duration: Duration,
+) -> Option<Duration> {
+    snapshot
+        .and_then(|snapshot| snapshot.queued_duration)
+        .map(|duration| duration.saturating_add(queued_output_duration))
+        .filter(|duration| !duration.is_zero())
+}
+
+fn audio_pump_limits_for_rate(rate: f64) -> (usize, Duration) {
+    if (rate - 1.0).abs() > PLAYBACK_RATE_EPSILON {
+        (
+            AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
+            AUDIO_FAST_RATE_PUMP_TIME_BUDGET,
+        )
+    } else {
+        (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
     }
 }
 
@@ -2928,14 +3270,14 @@ fn run_async_danmaku_planner(
             }
             seen_revision = state.revision;
             let config_update = (state.config_revision != applied_config_revision).then(|| {
-                let invalidate_stable_tracks = state.invalidate_stable_tracks;
-                state.invalidate_stable_tracks = false;
+                let invalidate_placement_history = state.invalidate_placement_history;
+                state.invalidate_placement_history = false;
                 (
                     state.config_revision,
                     state.timeline.clone(),
                     state.config.clone(),
                     state.rasterizer.clone(),
-                    invalidate_stable_tracks,
+                    invalidate_placement_history,
                 )
             });
             (state.latest_request, config_update)
@@ -2946,13 +3288,13 @@ fn run_async_danmaku_planner(
             next_timeline,
             next_config,
             next_rasterizer,
-            invalidate_stable_tracks,
+            invalidate_placement_history,
         )) = config_update
         {
             timeline = next_timeline;
             config = next_config;
-            if invalidate_stable_tracks {
-                engine.invalidate_stable_tracks();
+            if invalidate_placement_history {
+                engine.invalidate_placement_history();
             }
             engine.set_config_with_rasterizer(config.clone(), next_rasterizer);
             applied_config_revision = revision;
@@ -3280,11 +3622,10 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
 #[cfg(feature = "wgpu")]
 fn build_wgpu_renderer(config: MetalRendererConfig) -> Result<Box<dyn RendererBackend>> {
     #[cfg(target_os = "android")]
-    let mut renderer = crate::renderer::wgpu::AndroidRecoveringWgpuRenderer::new_with_output_mode(
-        config.output_mode,
-    )?;
+    let mut renderer =
+        crate::renderer::wgpu::AndroidRecoveringWgpuRenderer::new_with_config(config)?;
     #[cfg(not(target_os = "android"))]
-    let mut renderer = crate::renderer::wgpu::WgpuRenderer::new()?;
+    let mut renderer = crate::renderer::wgpu::WgpuRenderer::new_with_config(config)?;
     renderer.set_luma_upscaler(config.luma_upscaler);
     #[cfg(not(target_os = "android"))]
     if config.output_mode.is_edr() {
@@ -4306,6 +4647,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert_eq!(danmaku_motion_backstep(DanmakuMode::Top, 100.0, 140.0), 0.0);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_danmaku_worker_exits_before_presenter_can_unload() {
+        for _ in 0..32 {
+            let planner = AsyncDanmakuPlanner::new(
+                danmaku_engine("shutdown"),
+                DanmakuTimeline::default(),
+                DanmakuLayoutConfig::default(),
+            );
+            let shared = Arc::clone(&planner.shared);
+            drop(planner);
+            // No worker, including one not yet scheduled, may retain state
+            // and execute Rust code after the containing DLL is unloaded.
+            assert_eq!(Arc::strong_count(&shared), 1);
+        }
+    }
+
     #[test]
     fn async_danmaku_planner_applies_font_selection_generation() {
         let engine = danmaku_engine("async font");
@@ -4348,6 +4706,135 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    fn repeated_playback_rate_request_keeps_pending_transition_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let pending = PendingPlaybackRate {
+            rate: 2.0,
+            commit_at: deadline,
+        };
+
+        assert!(playback_rate_request_is_idempotent(1.0, Some(pending), 2.0));
+        assert_eq!(pending.commit_at, deadline);
+        assert!(playback_rate_request_is_idempotent(2.0, None, 2.0));
+        assert!(!playback_rate_request_is_idempotent(
+            1.0,
+            Some(pending),
+            1.5
+        ));
+    }
+
+    #[test]
+    fn audio_transition_bridge_includes_platform_output_duration() {
+        let snapshot = AudioClockSnapshot {
+            media_time: Some(Duration::from_secs(1)),
+            queued_duration: Some(Duration::from_millis(250)),
+            queued_frames: 12_000,
+            read_frames: 0,
+            written_frames: 12_000,
+            underflow_frames: 0,
+        };
+
+        assert_eq!(
+            audio_transition_bridge(Some(snapshot), Duration::from_millis(60)),
+            Some(Duration::from_millis(310))
+        );
+        assert_eq!(
+            audio_transition_bridge(
+                Some(AudioClockSnapshot {
+                    queued_duration: Some(Duration::ZERO),
+                    ..snapshot
+                }),
+                Duration::from_millis(60),
+            ),
+            Some(Duration::from_millis(60))
+        );
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn audio_reset_preserves_pending_rate_for_transition() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.pending_playback_rate = Some(PendingPlaybackRate {
+            rate: 2.0,
+            commit_at: Instant::now(),
+        });
+
+        presenter.reset_audio_output();
+        assert_eq!(
+            presenter.pending_playback_rate.map(|pending| pending.rate),
+            Some(2.0)
+        );
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn terminal_audio_reset_restores_committed_rate() {
+        use crate::audio::BufferedAudioOutput;
+        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        output.set_playback_rate(2.0);
+        presenter.audio_output = Box::new(output);
+        presenter.playback_rate = 1.0;
+        presenter.pending_playback_rate = Some(PendingPlaybackRate {
+            rate: 2.0,
+            commit_at: Instant::now(),
+        });
+
+        presenter.reset_audio_output_with_committed_rate();
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        presenter
+            .audio_output
+            .push(PcmAudioFrame {
+                format,
+                pts: Some(Duration::ZERO),
+                frames: 24_000,
+                samples: vec![0.0; 48_000],
+            })
+            .unwrap();
+
+        assert_eq!(
+            presenter
+                .audio_output
+                .clock_snapshot()
+                .unwrap()
+                .queued_frames,
+            24_000
+        );
+        assert!(presenter.pending_playback_rate.is_none());
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn failed_pending_rate_commit_clears_transition_state() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.pending_playback_rate = Some(PendingPlaybackRate {
+            rate: 2.0,
+            commit_at: Instant::now(),
+        });
+
+        assert!(presenter.commit_pending_playback_rate_now().is_err());
+        assert!(presenter.pending_playback_rate.is_none());
+        assert_eq!(presenter.playback_rate, 1.0);
+    }
+
+    #[test]
+    fn playback_rate_uses_fast_audio_pump_limits() {
+        assert_eq!(
+            audio_pump_limits_for_rate(1.0),
+            (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
+        );
+        assert_eq!(
+            audio_pump_limits_for_rate(2.0),
+            (
+                AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
+                AUDIO_FAST_RATE_PUMP_TIME_BUDGET
+            )
+        );
+    }
+
+    #[test]
     #[cfg(feature = "wgpu")]
     fn layout_config_generation_does_not_disturb_the_playback_clock() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
@@ -4378,6 +4865,110 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             presenter.runtime_snapshot().last_render_test_duration,
             Duration::ZERO
         );
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn foreground_tick_keeps_video_resume_pending_until_surface_is_ready() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.audio_only_tick_active = true;
+
+        presenter.render_tick(0.0).unwrap();
+        assert!(presenter.audio_only_tick_active);
+        assert!(presenter.resume_pending);
+
+        presenter.render_tick(0.016).unwrap();
+        assert!(presenter.audio_only_tick_active);
+        assert!(presenter.resume_pending);
+
+        presenter.audio_only_tick().unwrap();
+        assert!(presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn foreground_video_resume_stops_retrying_after_the_attempt_budget() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.audio_only_tick_active = true;
+        presenter.resume_pending = true;
+
+        for attempt in 1..MAX_VIDEO_DECODE_RESUME_ATTEMPTS {
+            presenter.note_video_decode_resume_failure("playback worker is not running");
+            assert_eq!(presenter.video_decode_resume_attempts, attempt);
+            assert!(presenter.resume_pending);
+        }
+
+        presenter.note_video_decode_resume_failure("playback worker is not running");
+        assert_eq!(
+            presenter.video_decode_resume_attempts,
+            MAX_VIDEO_DECODE_RESUME_ATTEMPTS
+        );
+        assert!(!presenter.resume_pending);
+
+        // A spent budget must not be re-armed by the next display frame, or the
+        // wedged worker would be probed once per tick again.
+        presenter.render_tick(0.016).unwrap();
+        assert!(presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+        assert_eq!(
+            presenter.video_decode_resume_attempts,
+            MAX_VIDEO_DECODE_RESUME_ATTEMPTS
+        );
+
+        // A new background/foreground cycle opens a fresh window.
+        presenter.audio_only_tick().unwrap();
+        assert_eq!(presenter.video_decode_resume_attempts, 0);
+        presenter.render_tick(0.032).unwrap();
+        assert!(presenter.resume_pending);
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn stop_keeps_the_video_decode_resume_owed_to_the_reused_worker() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.audio_only_tick_active = true;
+        presenter.resume_pending = true;
+        presenter.video_decode_resume_attempts = MAX_VIDEO_DECODE_RESUME_ATTEMPTS;
+
+        // `stop` reuses the current engine and never clears its
+        // `video_decode_suspended` flag, so the presenter must keep owing it a
+        // resume; only the in-flight attempt and its budget are dropped.
+        let _ = presenter.stop();
+        assert!(presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+        assert_eq!(presenter.video_decode_resume_attempts, 0);
+
+        // Returning to the foreground still arms the resume, so playback does
+        // not stay audio-only with a frozen frame.
+        presenter.render_tick(0.0).unwrap();
+        assert!(presenter.resume_pending);
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn only_engine_replacing_boundaries_forget_the_video_decode_resume() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        // `open` builds a fresh engine and `close` retires the worker, and a
+        // new engine decodes video, so the presenter owes it no resume.
+        presenter.audio_only_tick_active = true;
+        presenter.resume_pending = true;
+        presenter.video_decode_resume_attempts = 2;
+        presenter.reset_video_decode_resume_state();
+        assert!(!presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+        assert_eq!(presenter.video_decode_resume_attempts, 0);
+
+        // `stop` and a stopped-at-end replay reuse the engine, which keeps its
+        // `video_decode_suspended` flag set, so the obligation must survive.
+        presenter.audio_only_tick_active = true;
+        presenter.resume_pending = true;
+        presenter.video_decode_resume_attempts = 2;
+        presenter.cancel_pending_video_decode_resume();
+        assert!(presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+        assert_eq!(presenter.video_decode_resume_attempts, 0);
     }
 
     #[test]
@@ -4829,30 +5420,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             presenter.add_danmaku_track(second, "second", DanmakuTrackSource::Json, -1_000_000);
 
         assert_eq!(presenter.danmaku_tracks().len(), 2);
-        let plan = presenter.danmaku.render_plan(
+        let layout = presenter.danmaku.frame_layout(
             Duration::from_millis(1500),
             DanmakuViewport::new(640, 360),
             1,
         );
-        assert!(plan.items.iter().any(|item| item.item_id >> 48 == first_id));
         assert!(
-            plan.items
+            layout
+                .items
                 .iter()
-                .any(|item| item.item_id >> 48 == second_id)
+                .any(|item| item.text.as_ref() == "first")
+        );
+        assert!(
+            layout
+                .items
+                .iter()
+                .any(|item| item.text.as_ref() == "second")
+        );
+        assert_eq!(
+            layout
+                .items
+                .iter()
+                .map(|item| item.item_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
         );
 
         assert!(presenter.set_danmaku_track_enabled(first_id, false));
-        let plan = presenter.danmaku.render_plan(
+        let layout = presenter.danmaku.frame_layout(
             Duration::from_millis(1500),
             DanmakuViewport::new(640, 360),
             2,
         );
-        assert!(!plan.items.iter().any(|item| item.item_id >> 48 == first_id));
-        assert!(
-            plan.items
-                .iter()
-                .any(|item| item.item_id >> 48 == second_id)
-        );
+        assert_eq!(layout.items.len(), 1);
+        assert_eq!(layout.items[0].text.as_ref(), "second");
 
         assert!(presenter.remove_danmaku_track(second_id));
         assert_eq!(presenter.danmaku_tracks().len(), 1);

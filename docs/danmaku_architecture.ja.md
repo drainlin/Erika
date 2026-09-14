@@ -84,7 +84,7 @@ flowchart LR
 
 入力は NipaPlay DFM+ の抽象とそろえるべきです。つまり、正規化済み item、viewport、font metrics、user config です。Erika は独自の Rust 型を使っても構いませんが、field semantics は NipaPlay と一致していなければなりません。time、text、type_code、color、is_me、paint_width/paint_height、display_area、scroll_duration、allow_stacking、merge、max_quantity、max_lines、track_gap、outline、block_words などが DFM+ prepare に流れ込む必要があります。
 
-DFM+ の前段にある `DanmakuSession` は layout algorithm には参加しません。複数 track を同時に有効化でき、track ごとの offset と global offset は active timeline 構築時に適用され、source item id は track id で prefix されて multi-track merge 後の衝突を避けます。seek は generation が変わったという理由で prepare をやり直すべきではありません。prepare の失効条件は timeline/session の内容、viewport、config の変化です。generation は renderer の current-frame gate にだけ使います。
+DFM+ の前段にある `DanmakuSession` は layout algorithm には参加しません。複数 track を同時に有効化でき、track ごとの offset と global offset は active timeline 構築時に適用されます。merge 後は host の business id を layout identity に pack せず、session がその content revision 専用の一意な layout item id を割り当てます。連続する planner window は確定済みの track assignment と reject decision の両方を引き継ぎ、timeline/session content、viewport、layout config が変わったときだけ planning history を作り直します。generation は renderer の current-frame gate にだけ使います。
 
 出力側も NipaPlay DFM+ の抽象に近いままであるべきです。prepared layout は安定した結果を保持し、frame query は current media time に対する visible items と位置だけを返します。その後で Erika が `item_index` に対応する text、color、font size、outline などを `DanmakuFrameLayout` と `DanmakuRenderPlan` に変換します。
 
@@ -127,7 +127,7 @@ Flutter wrapper は `addDanmakuTrackFile`、`addDanmakuTrackJson`、`removeDanma
 
 `PlayerVideoFrame` は `pts`、`media_time`、`generation` を持ちます。presenter が `pump_video` で frame を upload した後、`frame.pts.unwrap_or(frame.media_time)` を現在の弾幕 query time として使います。その後 `update_overlay` が同じ PTS を使って subtitle overlay と danmaku render plan を生成します。最終的に renderer は `RenderFrameContext { media_time, generation, overlay, danmaku }` を受け取ります。
 
-renderer は不一致の danmaku plan を gate で落とします。Metal / WGPU ともに plan の `generation` が context generation と一致し、plan の `media_time` が context media time と一致し、viewport が現在の出力サイズに一致する必要があります。これにより seek、stop、close、track switch、config change の後に古い plan が描画され続けることを防ぎます。
+renderer は不一致の danmaku plan を gate で落とします。Metal / WGPU ともに plan の `generation` が context generation と一致し、viewport が現在の出力サイズに一致する必要があります。media_time の照合は presenter の windowed plan が担います——各 plan は `[window_start, window_end]` を持ち、再生時間が window を外れると古い plan は描画に回りません。これにより seek、stop、close、track switch、config change の後に古い generation / 古い window の plan が描画され続けることを防ぎます。
 
 つまり、弾幕位置は「pause 中に止まる」だけではありません。常に video media timeline によって決まります。再生中は media time に合わせて scrolling 弾幕が流れ、pause 中は media time が変わらないので位置も変わらず、seek 後は新しい media time を直接 query し、古い plan は generation 不一致で破棄されます。
 
@@ -170,4 +170,3 @@ API layer は NipaPlay の弾幕 input surface を player と Flutter wrapper �
 render layer は Erika の native 実装として保つべきです。DFM+ が出力するのは「current media time で各弾幕がどこにあり、どんな style か」であって、GPU texture や Flutter resource ではありません。Erika renderer はその出力を glyph atlas、quad instances、Metal/WGPU 合成に変え、動画と一緒に描画します。
 
 synchronization layer は現在の generation + media_time 契約を維持しなければなりません。seek、stop、close、track switch、config change はすべて古い plan を無効化し、各 frame query は video timeline だけを見ます。弾幕は別の wall-clock timer を持ちません。この契約こそが「動画は跳んだのに弾幕が跳ばない」を解決する本体です。
-

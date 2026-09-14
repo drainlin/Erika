@@ -30,7 +30,7 @@ Rust Player Core
 | 依赖 | 版本 | 作用 |
 |------|------|------|
 | FFmpeg | 8.1.2 | Demux、decode、audio resample、平台硬解 |
-| dav1d | 1.5.1 | Android AV1 软解回退（8-bit 与高位深） |
+| dav1d | 1.5.1 | 非 Windows 目标的 AV1 软解回退（8-bit 与高位深） |
 | libass | 0.17.5 | ASS 字幕渲染 |
 | FreeType | 2.14.3 | 字体栅格化（libass 依赖） |
 | HarfBuzz | 14.2.1 | 文本 shaping（libass 依赖） |
@@ -60,12 +60,31 @@ cargo run -p xtask -- deps status
 
 `VideoPlaybackEngine` 增加时钟驱动播放：
 
-- 播放、暂停、停止、seek、倍速控制、EOF 检测。
+- 播放、暂停、停止、seek、倍速控制（音频经 SoundTouch）、EOF 检测。
 - `PlaybackClock`：带音频主时钟约束的 media-time 锚点（deadband 校正、逐帧有界调整、大漂移 snap）。
 - `VideoFrameScheduler`：为解码后的视频帧决定 present / wait / drop。
 - `DisplaySyncState`：携带残余帧时长误差的 vsync 量化器。
 
 ## 音频输出
+
+时钟反馈通过 `Player::capture_audio_clock` 和
+`update_audio_clock_observation` 传递。观测保留 player 身份、播放 generation、
+命令序号、输出 epoch 和单调采样时间。worker 同时核对当前意图与已执行命令，
+并从采样时刻计算 500 ms 有效期；队列与缓冲决策使用相同的有效性检查。
+presenter 在输出重置、重新配置、设备状态切换和倍速切换时使旧 epoch 失效；
+输出拥有者仍需串行执行采样与输出变更。
+
+引擎先建立观测基线，随后要求已消耗 PCM 帧数与媒体时间同时推进，才校正共享的
+`PlaybackClock`。纯静音欠载回调与冻结快照不能持续拉回时钟；有效的大幅漂移
+允许向前或向后重锚。投递延迟补偿以采样时已排队的 PCM 时长为上限，并使用已提交
+的倍速。暂停或等待首帧而停驻的时钟保持停驻；后台播放和前台视频恢复期间，
+仍在运行的音频主时钟继续生效。
+
+原有 Rust API `update_audio_clock(snapshot)` 保留给当前时间线的即时同步反馈，
+无法还原缓存快照的原始采样身份；延迟反馈应使用新的观测 API。C ABI 与队列目标
+不变，保留 250 ms 倍速桥接及过渡期间抑制混合倍速反馈的契约。
+音频喂送仍在 presenter tick 中执行，渲染阻塞仍可能造成欠载；时钟恢复不能替代
+音频喂送与渲染的独立调度。
 
 - **macOS**：CoreAudio 输出，带 ring buffer 和 PTS 跟踪的 clock snapshot。presenter 会把输出快照回传给 player worker 做音频主时钟约束。
 - **iOS**：AudioQueue 输出，使用同样的 ring buffer 和 clock snapshot 模型。
@@ -153,7 +172,9 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 
 ## C ABI
 
-`erika_capi` 通过两组 handle family 导出 79 个函数：
+主头文件为 `crates/erika_capi/include/erika.h`，各包的副本须与其一致。两个 `erika_presenter_windows_*_iunknown` getter 仅在 Windows 导出；共用头文件在所有平台都保留其声明。
+
+`erika_capi` 提供两组 handle family：
 
 - **`ErikaHandle`**：播放器控制与事件轮询，渲染由宿主管理。
 - **`ErikaPresenterHandle`**：Erika 持有完整栈，宿主只需提供 surface 并调用 `render_tick`。
@@ -180,10 +201,10 @@ Embedding 模型和 HDR 策略见 `docs/flutter_embedding.md`。
 
 | Platform | Decode | Render | Audio | Status |
 |----------|--------|--------|-------|--------|
-| macOS 14+ | VideoToolbox | Metal | CoreAudio | Available |
-| iOS 16+ | VideoToolbox | Metal | AudioQueue | Available |
+| macOS 11+ | VideoToolbox | Metal | CoreAudio | Available |
+| iOS 13+ | VideoToolbox | Metal | AudioQueue | Available |
 | tvOS 13+ (Apple TV) | VideoToolbox | Metal | AudioQueue | Available |
 | Windows 10+ | D3D11VA | Direct3D 11 | WASAPI | Available |
 | Linux | — | wgpu (planned) | — | Planned |
 | Android 8+ | MediaCodec / software | wgpu Vulkan + GLES fallback | AAudio | Available；SDR 已验证，extended-linear scRGB 等待 API 35 HDR 真机验收 |
-| HarmonyOS API 18+ | AVCodec（H.264/HEVC）/ software | wgpu Vulkan，`OHNativeBuffer` 零拷贝导入 | OHAudio | Available；已在真机验证，尚未纳入 CI |
+| HarmonyOS API 18+ | AVCodec（H.264/HEVC）/ software | wgpu Vulkan，`OHNativeBuffer` 零拷贝导入 | OHAudio | Available；已在真机验证，CI 构建 OpenHarmony C ABI 但无设备侧运行验证 |

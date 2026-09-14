@@ -52,6 +52,18 @@ typedef struct ErikaHttpHeader {
   const char *value;
 } ErikaHttpHeader;
 
+/* Extended open parameters for erika_open_with_options /
+ * erika_presenter_open_with_options. Pass zero for fields you do not use;
+ * reserved must be zero. http_read_ahead_bytes overrides the HTTP(S)
+ * read-ahead window (in bytes); 0 uses ERIKA_HTTP_READAHEAD_BYTES when set,
+ * otherwise the 2 MiB default. */
+typedef struct ErikaOpenOptions {
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;
+  uint64_t reserved[3];
+} ErikaOpenOptions;
+
 typedef enum ErikaStatus {
   ErikaStatus_Ok = 0,
   ErikaStatus_NullPointer = 1,
@@ -167,10 +179,16 @@ typedef enum ErikaUpscalerBackendStatus {
   ErikaUpscalerBackendStatus_SimdgroupMatrix = 4,
 } ErikaUpscalerBackendStatus;
 
+typedef enum ErikaVideoAlphaMode {
+  ErikaVideoAlphaMode_Opaque = 0,
+  ErikaVideoAlphaMode_PackedAlphaRight = 1,
+} ErikaVideoAlphaMode;
+
 typedef struct ErikaPresenterConfig {
   int32_t output_mode;
   float edr_headroom;
   int32_t luma_upscaler;
+  int32_t video_alpha_mode;
 } ErikaPresenterConfig;
 
 #define ERIKA_SUBTITLE_OVERRIDE_FONT_SIZE_FIELDS (1u << 2)
@@ -418,13 +436,19 @@ char *erika_last_error_message(void);
 void erika_string_free(char *value);
 
 /* Playback control. uri is a local path or HTTP(S) URL; times are microseconds.
- * open() is asynchronous — watch StateChanged/DurationChanged events. */
+ * open() synchronously probes streams and transitions to Ready. */
 ErikaStatus erika_open(ErikaHandle *handle, const char *uri);
 ErikaStatus erika_open_with_headers(
     ErikaHandle *handle,
     const char *uri,
     const ErikaHttpHeader *headers,
     uintptr_t header_count);
+/* open_with_options supersedes open_with_headers: headers plus per-request
+ * tuning (currently the HTTP read-ahead window). */
+ErikaStatus erika_open_with_options(
+    ErikaHandle *handle,
+    const char *uri,
+    const ErikaOpenOptions *options);
 /* play enqueues work; observe StateChanged/Error for the authoritative result. */
 ErikaStatus erika_play(ErikaHandle *handle);
 ErikaStatus erika_pause(ErikaHandle *handle);
@@ -506,6 +530,15 @@ ErikaPresenterHandle *erika_presenter_create_with_playback_options(
     int32_t output_mode,
     float edr_headroom,
     uint64_t buffer_recovery_audio_micros);
+ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(
+    int32_t output_mode,
+    float edr_headroom,
+    int32_t video_alpha_mode);
+ErikaPresenterHandle *erika_presenter_create_with_playback_options_and_alpha(
+    int32_t output_mode,
+    float edr_headroom,
+    uint64_t buffer_recovery_audio_micros,
+    int32_t video_alpha_mode);
 void erika_presenter_destroy(ErikaPresenterHandle *handle);
 
 /* Playback and runtime parameters. volume is 0.0–1.0; rate 1.0 is normal speed;
@@ -518,6 +551,12 @@ ErikaStatus erika_presenter_open_with_headers(
     const char *uri,
     const ErikaHttpHeader *headers,
     uintptr_t header_count);
+/* open_with_options supersedes open_with_headers: headers plus per-request
+ * tuning (currently the HTTP read-ahead window). */
+ErikaStatus erika_presenter_open_with_options(
+    ErikaPresenterHandle *handle,
+    const char *uri,
+    const ErikaOpenOptions *options);
 /* play enqueues work; observe StateChanged/Error for the authoritative result. */
 ErikaStatus erika_presenter_play(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_pause(ErikaPresenterHandle *handle);
@@ -587,7 +626,8 @@ ErikaStatus erika_presenter_select_subtitle_track(
 /* Danmaku (bullet comments). load_* replaces danmaku with one anonymous track;
  * add_*_track builds a named multi-track list. Input is Bilibili XML (*_file,
  * by path/URL) or JSON (*_json, inline). offset_micros shifts one track's
- * timeline; the global offset shifts all. See docs/danmaku_architecture.md. */
+ * timeline; the global offset shifts all. The inline JSON schema is documented
+ * in docs/capi_reference.md; layout behavior is in docs/danmaku_architecture.md. */
 ErikaStatus erika_presenter_load_danmaku_file(
     ErikaPresenterHandle *handle,
     const char *uri);
@@ -669,6 +709,24 @@ ErikaStatus erika_presenter_attach_metal_layer(
     uint32_t height,
     double scale);
 
+/* Flutter compositor texture surface. The registrar texture_id identifies the
+ * surface; before every render_tick, select the host-owned GPU target with
+ * set_flutter_texture_buffer. On Apple, raw_texture is an id<MTLTexture> using
+ * BGRA8Unorm. The texture remains owned by the host. */
+ErikaStatus erika_presenter_attach_flutter_texture(
+    ErikaPresenterHandle *handle,
+    ErikaFlutterTextureKind kind,
+    int64_t texture_id,
+    uint32_t width,
+    uint32_t height,
+    double scale);
+
+ErikaStatus erika_presenter_set_flutter_texture_buffer(
+    ErikaPresenterHandle *handle,
+    uint64_t raw_texture,
+    uint32_t width,
+    uint32_t height);
+
 ErikaStatus erika_presenter_attach_wgpu_surface(
     ErikaPresenterHandle *handle,
     ErikaWgpuSurfaceKind kind,
@@ -695,6 +753,20 @@ ErikaStatus erika_presenter_attach_windows_hwnd(
     uint32_t width,
     uint32_t height,
     double scale);
+
+/* Windows only. Returns an AddRef'd IUnknown for a DirectComposition swap
+ * chain created by an attachment whose direct_composition capability is true.
+ * The caller owns the returned COM reference and must Release it. */
+ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(
+    ErikaPresenterHandle *handle,
+    void **out_swapchain);
+
+/* Windows only. Returns an AddRef'd IUnknown for the latest completed,
+ * immutable SDR Flutter GPU frame. The caller owns the COM reference and
+ * must Release it. The texture remains unchanged for its entire lifetime. */
+ErikaStatus erika_presenter_windows_flutter_texture_iunknown(
+    ErikaPresenterHandle *handle,
+    void **out_texture);
 
 ErikaStatus erika_presenter_resize_surface(
     ErikaPresenterHandle *handle,
@@ -732,9 +804,10 @@ char *erika_presenter_render_tick_json(
     double time_seconds);
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *handle);
 
-/* Screenshot: render the current composited frame (video + subtitle + danmaku)
- * off-screen into a caller-allocated RGBA8 buffer at the requested size.
- * out_capacity must be >= width*height*4. Fails if no frame is available yet. */
+/* Screenshot: render the current composited frame (video + subtitle, no
+ * danmaku) off-screen into a caller-allocated RGBA8 buffer at the requested
+ * size. out_capacity must be >= width*height*4. Fails if no frame is
+ * available yet. */
 ErikaStatus erika_presenter_capture_frame_rgba(
     ErikaPresenterHandle *handle,
     uint32_t width,

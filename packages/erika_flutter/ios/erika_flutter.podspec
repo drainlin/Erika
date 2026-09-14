@@ -10,6 +10,7 @@ Pod::Spec.new do |s|
     erika_presenter_create
     erika_presenter_create_with_output_mode
     erika_presenter_create_with_playback_options
+    erika_presenter_create_with_playback_options_and_alpha
     erika_presenter_danmaku_tracks
     erika_presenter_destroy
     erika_presenter_detach_surface
@@ -55,7 +56,7 @@ Pod::Spec.new do |s|
     .join(' ')
 
   s.name             = 'erika_flutter'
-  s.version          = '0.1.7'
+  s.version          = '0.1.9'
   s.summary          = 'Flutter embedder glue for the Erika Rust media engine.'
   s.description      = <<-DESC
 Flutter iOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.

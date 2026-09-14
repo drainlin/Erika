@@ -145,6 +145,8 @@ no-op. Destroying a handle stops playback and releases all resources.
 ErikaStatus erika_open(ErikaHandle *handle, const char *uri);   // file path or URL
 ErikaStatus erika_open_with_headers(ErikaHandle *handle, const char *uri,
                                     const ErikaHttpHeader *headers, uintptr_t header_count);
+ErikaStatus erika_open_with_options(ErikaHandle *handle, const char *uri,
+                                    const ErikaOpenOptions *options);
 ErikaStatus erika_play(ErikaHandle *handle);
 ErikaStatus erika_pause(ErikaHandle *handle);
 ErikaStatus erika_stop(ErikaHandle *handle);
@@ -158,9 +160,30 @@ may be released after it returns. When `header_count` is nonzero, `headers`
 must not be `NULL`. Headers are used for HEAD, Range GET, and prefetch requests.
 Authentication information and cookies are not written to Erika logs. `seek`
 takes microseconds.
-`open` and `play` enqueue work asynchronously. Watch for `StateChanged`,
-`DurationChanged`, and `Error` events for the authoritative result instead of
-blocking the host UI thread.
+
+`erika_open_with_options` supersedes `erika_open_with_headers`: it takes an
+`ErikaOpenOptions` struct that bundles the header array with per-request
+tuning. A `NULL` `options` pointer means defaults. `http_read_ahead_bytes`
+overrides the HTTP(S) read-ahead window in bytes for this request. `0` uses the
+process-wide `ERIKA_HTTP_READAHEAD_BYTES` override when it is set, otherwise
+the 2 MiB default; an explicit non-zero value supersedes the environment.
+Non-zero values in `reserved` are rejected so future fields can be added
+without silently changing behavior for older hosts. Read-ahead only affects
+HTTP(S) playback; local files ignore it.
+
+```c
+typedef struct ErikaOpenOptions {
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
+  uint64_t reserved[3];             /* must be zero */
+} ErikaOpenOptions;
+```
+
+`open` synchronously probes streams and transitions to `Ready`; `play` enqueues
+work asynchronously. Run blocking opens off the host UI thread and serialize
+all calls on the same handle. Observe `StateChanged`, `DurationChanged`, and
+`Error` events for subsequent playback changes.
 
 ### Tracks and subtitles
 
@@ -236,16 +259,25 @@ Erika owns the full stack; the host supplies a surface and calls `render_tick`.
 ErikaPresenterHandle *erika_presenter_create(void);
 ErikaPresenterHandle *erika_presenter_create_with_config(ErikaPresenterConfig config);
 ErikaPresenterHandle *erika_presenter_create_with_output_mode(int32_t output_mode, float edr_headroom);
+ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(int32_t output_mode, float edr_headroom,
+                                                                        int32_t video_alpha_mode);
 void                  erika_presenter_destroy(ErikaPresenterHandle *handle);
 ```
 
+Since v0.1.8, `ErikaPresenterConfig` has four fields (16 bytes); v0.1.7 used
+three fields (12 bytes). This by-value structure is not binary-compatible
+across those versions. Rebuild C/C++ callers and manual Swift/FFI mirrors
+with the matching header and native library, and initialize `video_alpha_mode`
+to `0` for opaque video.
+
 `ErikaPresenterConfig` selects the output mode (`Sdr`, Apple `AppleEdr`, or
 Android `ExtendedLinear`), the requested EDR/scRGB content-headroom ceiling,
-and the initial
-luma upscaler. Android `ExtendedLinear` means FP16 extended-linear scRGB, not
-HDR10/PQ. `create_with_output_mode` is a shorthand; `create` uses defaults
-(SDR, no upscaler). A `NULL` return means creation failed — check
-`erika_last_error_message`.
+the initial luma upscaler, and the `video_alpha_mode`
+(`ErikaVideoAlphaMode`). Android `ExtendedLinear` means FP16 extended-linear
+scRGB, not HDR10/PQ. `create_with_output_mode` and
+`create_with_output_mode_and_alpha` are shorthands; `create` uses defaults
+(SDR, opaque video, no upscaler). A `NULL` return means creation failed —
+check `erika_last_error_message`.
 
 ### Playback and runtime parameters
 
@@ -254,6 +286,8 @@ ErikaStatus erika_presenter_open(ErikaPresenterHandle *, const char *uri);
 ErikaStatus erika_presenter_open_with_headers(ErikaPresenterHandle *, const char *uri,
                                               const ErikaHttpHeader *headers,
                                               uintptr_t header_count);
+ErikaStatus erika_presenter_open_with_options(ErikaPresenterHandle *, const char *uri,
+                                              const ErikaOpenOptions *options);
 ErikaStatus erika_presenter_play(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_pause(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_stop(ErikaPresenterHandle *);
@@ -268,7 +302,10 @@ ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubt
 ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float headroom, bool known);
 ```
 
-`set_playback_rate(1.0)` is normal speed. `set_upscaler` switches the neural
+`set_playback_rate(1.0)` is normal speed. `erika_presenter_open_with_options`
+is the push-model counterpart of `erika_open_with_options` and accepts the same
+`ErikaOpenOptions` (headers plus `http_read_ahead_bytes`; see
+[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the neural
 luma upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture));
 Metal, D3D11 feature level 11+, and compute-capable wgpu renderers execute
 ArtCNN, while backends without compute retain native luma sampling and report
@@ -393,6 +430,25 @@ ErikaStatus erika_presenter_tracks(ErikaPresenterHandle *, ErikaTrackInfo *out_t
 
 Same semantics as the `ErikaHandle` track functions.
 
+In-memory subtitle fonts let a host register font data directly instead of
+relying on the bundled fallback font or system font providers:
+
+```c
+ErikaStatus erika_presenter_register_subtitle_memory_font(ErikaPresenterHandle *, const uint8_t *data, uintptr_t data_len, uint64_t *out_font_id);
+ErikaStatus erika_presenter_select_subtitle_memory_fonts(ErikaPresenterHandle *, const uint64_t *font_ids, uintptr_t font_count);
+ErikaStatus erika_presenter_clear_subtitle_memory_fonts(ErikaPresenterHandle *);
+ErikaStatus erika_presenter_get_subtitle_memory_font_status(ErikaPresenterHandle *, ErikaSubtitleMemoryFontStatus *out_status);
+ErikaStatus erika_presenter_get_subtitle_memory_font_info(ErikaPresenterHandle *, uint64_t font_id, ErikaSubtitleMemoryFontInfo *out_info);
+void erika_subtitle_memory_font_status_free(ErikaSubtitleMemoryFontStatus *status);
+void erika_subtitle_memory_font_info_free(ErikaSubtitleMemoryFontInfo *info);
+```
+
+Registered fonts count against a total byte limit. `select_subtitle_memory_fonts`
+replaces the active selection with the given already-registered ids (invalid or
+duplicate ids are rejected); `clear_subtitle_memory_fonts` drops both the
+selection and the registered fonts. The `*_free` helpers release the returned
+status/info buffers.
+
 ### Danmaku (bullet comments)
 
 ```c
@@ -405,6 +461,7 @@ ErikaStatus erika_presenter_set_danmaku_track_enabled(ErikaPresenterHandle *, ui
 ErikaStatus erika_presenter_set_danmaku_track_offset(ErikaPresenterHandle *, uint64_t track_id, int64_t offset_micros);
 ErikaStatus erika_presenter_set_danmaku_global_offset(ErikaPresenterHandle *, int64_t offset_micros);
 ErikaStatus erika_presenter_danmaku_tracks(ErikaPresenterHandle *, ErikaDanmakuTrackInfo *out_tracks, uintptr_t capacity, uintptr_t *out_len);
+void erika_danmaku_track_info_free(ErikaDanmakuTrackInfo *track);
 ErikaStatus erika_presenter_clear_danmaku(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_danmaku_enabled(ErikaPresenterHandle *, bool enabled);
 ErikaStatus erika_presenter_set_debug_hud_enabled(ErikaPresenterHandle *, bool enabled);
@@ -423,6 +480,25 @@ tracks. `set_danmaku_config` / `_ptr` apply the full `ErikaDanmakuConfig` (the
 `_ptr` variant avoids passing the struct by value); `get_danmaku_config` reads
 it back. See [danmaku_architecture.md](danmaku_architecture.md) for the layout
 engine. `set_danmaku_block_words_json` takes a JSON array of strings to filter.
+
+Inline JSON may be an item array or an object containing a `comments`,
+`danmaku`, or `items` array. Each item accepts these fields (aliases in
+parentheses):
+
+- `content` (`text`, `c`): text; an item with missing or blank text is skipped.
+- `time` (`t`): presentation time in seconds, defaulting to `0`.
+- `type` (`mode`, `y`): `scroll`/`1`, `bottom`/`4`, `top`/`5`, `reverse`/`6`,
+  or `special`/`7`. Numeric `type_code` / `mode_code` are also accepted.
+- `color` (`r`): decimal RGB, `#RRGGBB`, or `rgb(r,g,b)`.
+- `font_size` (`fontSize`, `size`, `s`), `opacity` (`alpha`, `a`), and `is_me`
+  (`isMe`, `self`, `mine`): optional style and self-danmaku metadata.
+- `id`: an optional unsigned 64-bit integer or decimal string. When omitted,
+  Erika assigns the item's position in the complete input. The session creates
+  a separate internal layout identity, so hosts do not need to synthesize a
+  business ID to keep tracks stable across planner windows.
+
+Unknown fields are ignored, so standard maps carrying source fields such as
+`cid` or `danmakuId` may be passed through unchanged.
 
 `set_debug_hud_enabled` is off by default. When enabled, the Presenter draws a
 native diagnostic HUD in the video composition. It shows track
@@ -460,6 +536,48 @@ per-`SurfaceView` `setDesiredHdrHeadroom`. Erika still verifies Vulkan,
 `Rgba16Float`, and `ADATASPACE_SCRGB_LINEAR` itself; failure of any condition
 falls back to SDR and remains queryable.
 
+### Flutter texture surfaces
+
+```c
+ErikaStatus erika_presenter_attach_flutter_texture(ErikaPresenterHandle *, ErikaFlutterTextureKind kind,
+                                                   int64_t texture_id, uint32_t w, uint32_t h, double scale);
+ErikaStatus erika_presenter_set_flutter_texture_buffer(ErikaPresenterHandle *, uint64_t raw_texture,
+                                                       uint32_t w, uint32_t h);
+```
+
+`attach_flutter_texture` binds the presenter to a texture-registrar surface
+identified by `texture_id` (Apple `MacOsTextureRegistrar`/`IosTextureRegistrar`
+today). The host owns the pixel buffers; before **every** `render_tick` it
+selects the GPU target for the next frame with
+`set_flutter_texture_buffer`, passing an `id<MTLTexture>` pointer cast to
+`uint64_t` that must use `BGRA8Unorm` and match the declared `w`×`h`. The
+texture is only borrowed for the duration of the frame — the host keeps
+ownership and may reuse or free it once `render_tick` returns. This is the
+surface the Flutter plugin's `ErikaTextureVideoView` uses on macOS.
+
+### Windows DirectComposition swap chain
+
+```c
+ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresenterHandle *, void **out_swapchain);
+```
+
+Windows only. When the presenter was attached through
+`attach_wgpu_surface_with_output_capabilities` with `direct_composition = true`
+(and the presenter plays with a transparent video alpha mode or an overlay
+blend), Erika creates a premultiplied-alpha composition swap chain for the
+target HWND. This getter returns it as an **AddRef'd `IUnknown*`**: the caller
+owns the returned COM reference and must `Release` it. Re-fetch it after
+decoder/device loss — Erika recreates the swap chain and exposes the new
+object; the same pointer means nothing was rebuilt.
+
+### Windows Flutter texture
+
+```c
+ErikaStatus erika_presenter_windows_flutter_texture_iunknown(ErikaPresenterHandle *, void **out_texture);
+```
+
+Windows only; this symbol is not exported on other platforms. Returns the latest completed, immutable SDR Flutter GPU frame as an **AddRef'd `IUnknown*`**. The caller owns the reference and must `Release` it. Keep the reference while consuming the frame; its texture contents remain unchanged throughout its lifetime. A null output pointer returns `NullPointer`. With a valid presenter but no completed Flutter texture, it returns `PlayerError` and clears the output pointer. Drive rendering before requesting a frame.
+
 ### Render loop and events
 
 ```c
@@ -470,10 +588,17 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *, ErikaEvent *out_e
 
 Call `render_tick` once per display frame (e.g. from `CADisplayLink`,
 `CVDisplayLink`, or a Windows frame scheduler). `time_seconds` is the host
-display clock for the frame in seconds — Erika uses it for vsync-quantized
-scheduling, so pass the presentation timestamp, not wall-clock deltas. If
+display clock for the frame in seconds; it drives the idle test pattern
+animation, so pass the presentation timestamp, not wall-clock deltas. If
 `out_stats` is non-`NULL` it is filled with a snapshot of pipeline counters.
 `poll_event` is non-blocking and returns `NoEvent` when idle.
+
+`audio_only_tick` advances audio output without rendering, for hosts that have
+no surface attached:
+
+```c
+ErikaStatus erika_presenter_audio_only_tick(ErikaPresenterHandle *, ErikaPresenterStats *out_stats);
+```
 
 `get_stats` fills the same `ErikaPresenterStats` snapshot without rendering a
 frame. Use it when the host samples counters on a different cadence from the
@@ -500,7 +625,7 @@ All three wrap their result in an envelope:
 
 ```json
 { "ok": true,  "status": 0, "value": <result> }
-{ "ok": false, "status": 1, "error": "<message>" }
+{ "ok": false, "status": 3, "error": "<message>" }
 ```
 
 `arguments_json` must be a JSON object. `method` selects the operation and
@@ -512,7 +637,9 @@ mirrors the C entry points: `open`, `play`, `pause`, `stop`, `close`, `seek`,
 `loadDanmakuJson`, `addDanmakuTrackFile`, `addDanmakuTrackJson`,
 `removeDanmakuTrack`, `setDanmakuTrackEnabled`, `setDanmakuTrackOffset`,
 `setDanmakuGlobalOffset`, `danmakuTracks`, `clearDanmaku`, `setDanmakuEnabled`,
-`setDanmakuConfig`). An unknown method fails with `ok: false` rather than
+`setDanmakuConfig`), plus `selectSubtitleMemoryFonts`,
+`clearSubtitleMemoryFonts`, `getSubtitleMemoryFontStatus`, and
+`getResourceStatus`. An unknown method fails with `ok: false` rather than
 aborting. The authoritative dispatch table is
 `crates/erika_capi/src/presenter_json.rs`.
 
@@ -525,6 +652,7 @@ structs across their platform channel should prefer the typed entry points.
 ```c
 ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUpscalerStatus *out_status);
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
+ErikaStatus erika_presenter_get_resource_status(ErikaPresenterHandle *, ErikaPresenterResourceStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
 ```
@@ -567,12 +695,14 @@ The fallback values are ABI-stable; append new reasons, never renumber `0..8`:
 | 8 | `LegacyAppleEdrUnsupported` | `legacy_apple_edr_unsupported` | Apple EDR was requested on a backend that does not implement it. |
 
 `capture_frame_rgba` is a **screenshot**: it renders the current composited
-frame (video + subtitle + danmaku) off-screen into a caller-allocated RGBA8
-buffer at the requested `width`×`height` (independent of the display surface
-size). `out_capacity` must be at least `width*height*4`. It returns `PlayerError`
-when no frame is available yet. Metal and wgpu (including Android) implement
-capture; the current D3D11 backend does not. Capture always uses an SDR RGBA8
-offscreen target and tone-maps HDR/extended-linear content, so the returned
+frame (video + subtitle) off-screen into a caller-allocated RGBA8 buffer at the
+requested `width`×`height` (independent of the display surface size). Danmaku
+is deliberately not included — screenshots represent the video rather than
+transient on-screen comments. `out_capacity` must be at least `width*height*4`.
+It returns `PlayerError` when no frame is available yet. Metal and wgpu
+(including Android) implement capture; the current D3D11 backend does not.
+Capture always uses an SDR RGBA8 offscreen target and tone-maps
+HDR/extended-linear content, so the returned
 bytes are SDR even when the display output is Apple EDR, HDR10, or Android
 extended-linear scRGB.
 
@@ -585,17 +715,25 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 free(rgba);
 ```
 
+`get_resource_status` reports memory budgeting for diagnostics: current device
+allocation, recommended working set, per-bucket GPU byte estimates (video
+frames, overlay and danmaku atlases, danmaku vertex buffers, upscaler), the
+renderer-tracked total, presenter CPU-side danmaku atlas bytes, the drawable
+count, and how many times the output mode was switched. All values are
+snapshots from the same runtime state as `get_output_status`.
+
 ## Enums
 
 | Enum | Values |
 |------|--------|
 | `ErikaState` | `Idle` `Opening` `Ready` `Playing` `Paused` `Stopped` `Closed` `Error` |
-| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` |
+| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` `VideoDecoderChanged` `AudioOutputChanged` |
 | `ErikaTrackKind` | `Video` `Audio` `Subtitle` |
 | `ErikaTrackSource` | `Embedded` `External` |
-| `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` |
+| `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` `OhosNativeWindow` |
 | `ErikaFlutterTextureKind` | `Unknown` `MacOsTextureRegistrar` `IosTextureRegistrar` `AndroidSurfaceTexture` `WindowsTextureRegistrar` `LinuxTextureRegistrar` |
-| `ErikaPresenterOutputMode` | `Sdr` `AppleEdr` `ExtendedLinear` |
+| `ErikaVideoAlphaMode` | `Opaque` `PackedAlphaRight` |
+| `ErikaPresenterOutputMode` | `Sdr` `AppleEdr` `ExtendedLinear` `Auto` |
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
@@ -604,13 +742,24 @@ free(rgba);
 
 ## Structs
 
-- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; }` —
-  passed by value to `create_with_config`.
+- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; int32 video_alpha_mode; }` —
+  passed by value to `create_with_config`; `video_alpha_mode` is an
+  `ErikaVideoAlphaMode` (`Opaque` default, `PackedAlphaRight` for side-by-side
+  colour/alpha assets).
 - **`ErikaSurfaceOutputCapabilities`** `{ bool extended_linear; bool direct_composition; float desired_headroom; int32 fallback_reason; }` — host-side Android display/surface probe supplied at attach time; `desired_headroom == 0` selects system auto.
 - **`ErikaUpscalerStatus`** — requested mode, active backend, fallback count,
   upscaled frames, last encode/GPU micros.
 - **`ErikaOutputStatus`** — the 13-field negotiated output snapshot documented
   under [Diagnostics and capture](#diagnostics-and-capture).
+- **`ErikaPresenterResourceStatus`** — device/recommended working set bytes,
+  per-bucket GPU byte estimates, renderer-tracked total, drawable count, and
+  output-mode switch count; filled by `get_resource_status`.
+- **`ErikaSubtitleMemoryFontStatus`** — registered/selected count and total
+  bytes for in-memory subtitle fonts; free with
+  `erika_subtitle_memory_font_status_free`.
+- **`ErikaSubtitleMemoryFontFace`** / **`ErikaSubtitleMemoryFontInfo`** —
+  per-font face details and aggregate info; free with
+  `erika_subtitle_memory_font_info_free`.
 - **`ErikaDanmakuConfig`** — full danmaku layout/appearance config (font size,
   opacity, display area, scroll timing, collision/stacking flags, blocked modes,
   shadow style). `font_size` is a NipaPlay/Flutter *logical* size; Erika

@@ -30,7 +30,7 @@ Rust Player Core
 | 依存関係 | バージョン | 目的 |
 |----------|-----------|------|
 | FFmpeg | 8.1.2 | Demux、decode、audio resample、プラットフォーム HW decode |
-| dav1d | 1.5.1 | Android AV1 software fallback（8-bit / high bit depth） |
+| dav1d | 1.5.1 | 非 Windows ターゲットの AV1 software fallback（8-bit / high bit depth） |
 | libass | 0.17.5 | ASS subtitle 描画 |
 | FreeType | 2.14.3 | フォントラスタライズ（libass 依存） |
 | HarfBuzz | 14.2.1 | テキストシェーピング（libass 依存） |
@@ -66,6 +66,28 @@ Decoder availability は session invariant です。video track が選択され�
 - `DisplaySyncState`: residual frame-duration error を持ち回る vsync quantizer です。
 
 ## 音声出力
+
+時刻フィードバックには `Player::capture_audio_clock` と
+`update_audio_clock_observation` を使います。観測値は player の識別子、再生
+generation、command sequence、output epoch、単調な取得時刻を保持します。
+worker は現在の再生意図と実行済みコマンドの両方を照合し、取得から 500 ms で
+観測値を失効させます。キューと buffering の判断にも同じ検証を適用します。
+presenter は出力リセット、再設定、デバイス状態の遷移、速度変更で epoch を
+更新します。取得と出力変更は引き続き出力の所有者が直列化します。
+
+engine は最初に基準値を記録し、消費した PCM frame 数と media time の両方が
+進んだ場合だけ共有 `PlaybackClock` を補正します。無音の underflow callback や
+停止した snapshot は時計を繰り返し巻き戻しません。有効な大きいずれは両方向に
+再同期できます。配送遅延の補間は取得時のキュー内 PCM 時間を上限とし、確定済み
+の速度を使います。pause や最初の frame 待ちで止めた時計は動かしません。
+background 再生と foreground の video 復帰中も、動作中の audio master は有効です。
+
+従来の Rust API `update_audio_clock(snapshot)` は現在の時間軸で即座に取得する
+同期フィードバック向けに残ります。保存済み snapshot の取得時の識別情報は
+復元できないため、遅延する呼び出しには観測 API を使います。C ABI とキューの
+目標量は変更せず、250 ms の速度変更 bridge と遷移中の混在した速度の観測を
+抑制する契約を維持します。音声供給はまだ presenter tick 内で行うため、描画が
+止まると underflow は発生し得ます。時刻の復旧と音声供給の独立化は別の処理です。
 
 - **macOS**: ring buffer と PTS-tracking clock snapshot を持つ CoreAudio 出力。presenter は snapshot を player worker に返し、audio-master clock discipline を維持します。
 - **iOS**: 同じ ring buffer / clock snapshot model を持つ AudioQueue 出力。
@@ -153,7 +175,9 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 
 ## C ABI
 
-`erika_capi` は 2 つの handle family で 79 関数を export します。
+正本のヘッダーは `crates/erika_capi/include/erika.h` で、各 package のコピーは一致させます。2 つの `erika_presenter_windows_*_iunknown` getter は Windows のみで export されますが、共通ヘッダーには全 platform で宣言されます。
+
+`erika_capi` は 2 つの handle family を提供します。
 
 - **`ErikaHandle`**: player control と event polling。rendering は host 管理です。
 - **`ErikaPresenterHandle`**: Erika が full stack を所有します。host は surface を渡して `render_tick` を呼びます。
@@ -180,10 +204,10 @@ embedding model と HDR strategy は `docs/flutter_embedding.md` を参照して
 
 | Platform | Decode | Render | Audio | Status |
 |----------|--------|--------|-------|--------|
-| macOS 14+ | VideoToolbox | Metal | CoreAudio | Available |
-| iOS 16+ | VideoToolbox | Metal | AudioQueue | Available |
+| macOS 11+ | VideoToolbox | Metal | CoreAudio | Available |
+| iOS 13+ | VideoToolbox | Metal | AudioQueue | Available |
 | tvOS 13+ (Apple TV) | VideoToolbox | Metal | AudioQueue | Available |
 | Windows 10+ | D3D11VA | Direct3D 11 | WASAPI | Available |
 | Linux | — | wgpu (planned) | — | Planned |
 | Android 8+ | MediaCodec / software | wgpu Vulkan + GLES fallback | AAudio | Available。SDR は検証済み、extended-linear scRGB は API 35 HDR 実機 acceptance 待ち |
-| HarmonyOS API 18+ | AVCodec（H.264/HEVC）/ software | wgpu Vulkan、`OHNativeBuffer` zero-copy import | OHAudio | Available。実機で検証済み、CI は未カバー |
+| HarmonyOS API 18+ | AVCodec（H.264/HEVC）/ software | wgpu Vulkan、`OHNativeBuffer` zero-copy import | OHAudio | Available。実機で検証済み、CI は OpenHarmony C ABI をビルドするがデバイス側の実行検証はなし |
